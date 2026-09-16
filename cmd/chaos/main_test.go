@@ -66,6 +66,9 @@ func TestRunPrintsSummary(t *testing.T) {
 	if strings.Contains(out, "not evaluated") {
 		t.Errorf("some invariant was not evaluated:\n%s", out)
 	}
+	if regexp.MustCompile(`(?m)^P[1-6]\s`).MatchString(out) {
+		t.Errorf("the random schedule sends no play commands, but the summary lists play invariants:\n%s", out)
+	}
 }
 
 func TestRunScenarioWithTrace(t *testing.T) {
@@ -97,9 +100,16 @@ func TestRunAllScenarios(t *testing.T) {
 	if err := run(t.Context(), args, &stdout, &stderr); err != nil {
 		t.Fatalf("run: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
 	}
-	for _, name := range []string{"leader_crash_mid_settlement", "client_retry_storm", "exclusion_change_at_settle", "late_learner"} {
+	for _, name := range []string{"leader_crash_mid_settlement", "client_retry_storm", "exclusion_change_at_settle", "late_learner",
+		"duplicate_intents_after_leader_change", "stale_sequence_replay", "partition_during_payout_claim",
+		"token_expiry_mid_round", "deal_during_leader_change"} {
 		if !hasSummaryRow(stdout.String(), name) {
 			t.Errorf("summary lacks a row for %s:\n%s", name, stdout.String())
+		}
+	}
+	for _, id := range []string{"P1", "P2", "P3", "P4", "P5", "P6"} {
+		if !regexp.MustCompile(`(?m)^` + id + `\s+[1-9]\d*\s+ok\s`).MatchString(stdout.String()) {
+			t.Errorf("summary lacks an evaluated %s row:\n%s", id, stdout.String())
 		}
 	}
 }
@@ -115,7 +125,8 @@ func TestRunListScenarios(t *testing.T) {
 	if err := run(t.Context(), []string{"-list-scenarios"}, &stdout, &stderr); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"dueling_leaders", "late_learner", "leader_crash_mid_settlement", "client_retry_storm", "exclusion_change_at_settle"} {
+	for _, name := range []string{"dueling_leaders", "late_learner", "leader_crash_mid_settlement", "client_retry_storm", "exclusion_change_at_settle",
+		"duplicate_intents_after_leader_change", "stale_sequence_replay", "partition_during_payout_claim", "token_expiry_mid_round", "deal_during_leader_change"} {
 		if !strings.Contains(stdout.String(), name+"\n") {
 			t.Errorf("scenario list lacks %s:\n%s", name, stdout.String())
 		}

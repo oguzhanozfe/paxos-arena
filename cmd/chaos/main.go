@@ -220,7 +220,8 @@ func formatReport(p sim.Params, rep sim.Report) string {
 	return b.String()
 }
 
-// printSummary writes the per-scenario table and the invariant table.
+// printSummary writes the per-scenario table and the invariant table. The
+// rows of the play invariants P1-P6 appear only when a run evaluated them.
 func printSummary(w io.Writer, sums []*summary) {
 	fmt.Fprintln(w)
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
@@ -240,6 +241,11 @@ func printSummary(w io.Writer, sums []*summary) {
 	for _, inv := range sim.Invariants {
 		result := "ok"
 		if total[inv.ID] == 0 {
+			if strings.HasPrefix(inv.ID, "P") {
+				// The play invariants need play commands, which only the
+				// play scenarios send.
+				continue
+			}
 			result = "not evaluated"
 		}
 		fmt.Fprintf(tw, "%s\t%d\t%s\t%s\n", inv.ID, total[inv.ID], result, inv.Desc)

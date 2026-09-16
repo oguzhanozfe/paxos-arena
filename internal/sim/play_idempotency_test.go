@@ -101,8 +101,6 @@ func (ps *playSim) ok(key string, op tournament.Op) tournament.Result {
 	return res
 }
 
-var simDealSecret = []byte("sim-deal-secret-of-at-least-32-bytes!!")
-
 // TestPlayIntentsIdempotentAcrossLeaderChange: the leader proposes a move
 // and a claim and crashes before the client learns their outcome; the
 // client resends both keys to the new leader, whose Phase 1 may also

@@ -11,12 +11,13 @@ import (
 type evKind uint8
 
 const (
-	evTick      evKind = iota // one node's Tick
-	evClient                  // one client's turn
-	evFault                   // draw the random fault probabilities
-	evRestart                 // restart a crashed node
-	evHardCrash               // crash a node whose armed torn write did not fire
-	evScript                  // a scripted scenario step
+	evTick       evKind = iota // one node's Tick
+	evClient                   // one client's turn
+	evFault                    // draw the random fault probabilities
+	evRestart                  // restart a crashed node
+	evHardCrash                // crash a node whose armed torn write did not fire
+	evScript                   // a scripted scenario step
+	evPlayClient               // one play client's turn
 )
 
 func (k evKind) String() string {
@@ -33,6 +34,8 @@ func (k evKind) String() string {
 		return "hardcrash"
 	case evScript:
 		return "script"
+	case evPlayClient:
+		return "play_client"
 	}
 	return fmt.Sprintf("event(%d)", uint8(k))
 }
@@ -69,10 +72,12 @@ func (h *eventHeap) Pop() any {
 }
 
 // Violation is a safety invariant failure found by the Checker. Invariant is
-// the design's identifier (S1 through S8, D1 through D6). Its Error string
+// the identifier of design section 6 (S1 through S8, D1 through D6) or of
+// docs/UNITY-INTEGRATION.md section 12 (P1 through P6). Its Error string
 // carries the seed, step and scenario needed to replay the run.
 type Violation struct {
-	// Invariant is the design's identifier, S1 through S8 or D1 through D6.
+	// Invariant is the identifier: S1 through S8, D1 through D6, P1 through
+	// P6.
 	Invariant string
 	// Detail says which node, slot or ballot broke the rule.
 	Detail string

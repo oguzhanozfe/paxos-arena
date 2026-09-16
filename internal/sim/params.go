@@ -97,6 +97,11 @@ type Params struct {
 	Scenario string
 	// NoLease disables the leader lease on every node.
 	NoLease bool
+	// PlayClients is the number of clients that run server-authoritative
+	// play tournaments (docs/UNITY-INTEGRATION.md) through a model of the
+	// play API: sessions, entries, deals, moves, finishes, close, settle and
+	// claims. The random schedule runs none; the play scenarios set it.
+	PlayClients int
 
 	// skipScoreP is the probability that an entrant never submits a score,
 	// so that some tournaments void at Close.
@@ -110,6 +115,29 @@ type Params struct {
 	singleBatch bool
 	// unsafe switches protocol rules off; set only by tests in this package.
 	unsafe *replog.UnsafeKnobs
+
+	// playEntrants is the number of players per play tournament; 0 means
+	// playEntrantsDefault.
+	playEntrants int
+	// playSessionTTL is the lifetime of the session tokens the simulated
+	// play API signs; 0 means session.DefaultTTL.
+	playSessionTTL time.Duration
+	// playResendP is the probability that a completed deal, move or claim
+	// is resent with its key to whichever node the client targets.
+	playResendP float64
+	// playAttackP is the probability that, before each of its intents, a
+	// player replays a captured earlier intent: under a new key with its
+	// used sequence number, with a number skipped ahead, or under its key.
+	playAttackP float64
+	// playClaimAgainP is the probability that a player whose claim
+	// succeeded claims again under a new key.
+	playClaimAgainP float64
+	// playSuspend suspends one player's app per play tournament in the
+	// middle of its round for longer than a session token lives.
+	playSuspend bool
+	// playRetryElsewhere sends every retry of a play intent to another
+	// node than the attempt before it.
+	playRetryElsewhere bool
 }
 
 // DefaultParams returns the random-mode parameters used by TestRandom: three
@@ -169,8 +197,8 @@ func (p Params) Validate() error {
 	if p.ClockSkewMax < 0 {
 		return errors.New("sim: ClockSkewMax must not be negative")
 	}
-	if p.Clients < 0 || p.Tournaments < 0 || p.Entrants < 0 {
-		return errors.New("sim: Clients, Tournaments and Entrants must not be negative")
+	if p.Clients < 0 || p.Tournaments < 0 || p.Entrants < 0 || p.PlayClients < 0 {
+		return errors.New("sim: Clients, Tournaments, Entrants and PlayClients must not be negative")
 	}
 	if p.Scenario != "" && findScenario(p.Scenario) == nil {
 		return fmt.Errorf("sim: unknown scenario %q (known: %v)", p.Scenario, Scenarios())
@@ -288,4 +316,10 @@ var Invariants = []struct {
 	{"D4", "standings are a function of the scores and the tie-break rule"},
 	{"D5", "eligibility checked and its list version recorded at entry and payout"},
 	{"D6", "money never appears or disappears"},
+	{"P1", "no double claim: one claim posting per player, only when settled, for the payouts not withheld"},
+	{"P2", "sequence numbers consumed 1, 2, 3 per player; stale and skipped numbers change nothing"},
+	{"P3", "no card shown before its deal is chosen; no stock card before its draw; seed only when finished"},
+	{"P4", "scores are computed by the server: moves replay legally, scores match the replay"},
+	{"P5", "every deal seed is the one the deal secret derives"},
+	{"P6", "no move accepted past its deadline; the state clock never decreases"},
 }

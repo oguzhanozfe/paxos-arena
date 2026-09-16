@@ -73,7 +73,7 @@ func crashPoint(v int) string {
 	return "on the first Accept sent"
 }
 
-var scenarios = []*scenario{
+var scenarios = append([]*scenario{
 	{
 		name: "leader_crash_mid_settlement",
 		params: func(p *Params) {
@@ -212,7 +212,7 @@ var scenarios = []*scenario{
 			p.PartitionP, p.HealP, p.CrashP = 0.005, 0.03, 0.003
 		},
 	},
-}
+}, playScenarios...)
 
 // Scenarios lists the scripted scenario names.
 func Scenarios() []string {

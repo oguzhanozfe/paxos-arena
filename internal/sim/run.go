@@ -28,6 +28,7 @@ type Run struct {
 	net         *transport.Network
 	nodes       []*simNode
 	clients     []*client
+	playClients []*playClient
 	checker     *Checker
 	trace       io.Writer
 	scenario    *scenario
@@ -41,6 +42,10 @@ type Run struct {
 	eager       []*simNode
 	late        *lateLearner
 	mid         *midSettlement
+	dup         *dupIntents
+	claimSplit  *claimPartition
+	expiry      *tokenExpiry
+	dealChange  *dealChange
 	report      Report
 	violation   error
 	quorum      int
@@ -99,6 +104,10 @@ func New(p Params, trace io.Writer) (*Run, error) {
 	for i := 0; i < p.Clients; i++ {
 		r.clients = append(r.clients, newClient(i, p.tournamentsPerBatch()))
 		r.schedule(event{at: r.jitter(clientInterval), kind: evClient, client: i})
+	}
+	for i := 0; i < p.PlayClients; i++ {
+		r.playClients = append(r.playClients, newPlayClient(i))
+		r.schedule(event{at: r.jitter(clientInterval), kind: evPlayClient, client: i})
 	}
 	r.schedule(event{at: faultInterval, kind: evFault})
 	if sc != nil && sc.setup != nil {
@@ -367,6 +376,9 @@ func (r *Run) handleEvent(ev event) {
 	case evClient:
 		r.clientTurn(r.clients[ev.client])
 		r.schedule(event{at: r.clock + clientInterval + r.jitter(clientInterval), kind: evClient, client: ev.client})
+	case evPlayClient:
+		r.playTurn(r.playClients[ev.client])
+		r.schedule(event{at: r.clock + clientInterval + r.jitter(clientInterval), kind: evPlayClient, client: ev.client})
 	case evFault:
 		if r.faultsOn {
 			r.randomFaults()
@@ -467,6 +479,11 @@ func (r *Run) complete() bool {
 			return false
 		}
 	}
+	for _, c := range r.playClients {
+		if !c.idle() {
+			return false
+		}
+	}
 	nodes := r.coreNodes()
 	var lb paxos.Ballot
 	var ci paxos.Slot
@@ -527,7 +544,17 @@ func (r *Run) progress() string {
 			}
 		}
 	}
-	fmt.Fprintf(&b, " %d of %d clients pending;", pending, len(r.clients))
+	for _, c := range r.playClients {
+		if !c.idle() {
+			pending++
+			if c.pending != nil {
+				fmt.Fprintf(&b, " play client %d waits on %s (%s, %d attempts);", c.id, c.pending.key, c.pending.kind, c.pending.attempts)
+			} else if c.pausedUntil > r.clock {
+				fmt.Fprintf(&b, " play client %d is suspended until t=%v;", c.id, c.pausedUntil)
+			}
+		}
+	}
+	fmt.Fprintf(&b, " %d of %d clients pending;", pending, len(r.clients)+len(r.playClients))
 	for _, nd := range r.coreNodes() {
 		if !nd.alive {
 			fmt.Fprintf(&b, " node %d down;", nd.id)
@@ -558,6 +585,9 @@ func (r *Run) Report() Report {
 	}
 	rep.Issued = 0
 	for _, c := range r.clients {
+		rep.Issued += c.issued
+	}
+	for _, c := range r.playClients {
 		rep.Issued += c.issued
 	}
 	c := r.checker

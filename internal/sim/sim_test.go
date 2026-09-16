@@ -88,18 +88,20 @@ func runFull(t *testing.T, p Params) Report {
 	if rep.Unexpected != 0 {
 		t.Fatalf("%d unexpected results for workflow steps\nreplay: %s", rep.Unexpected, replay(t, p))
 	}
-	if ep.Clients > 0 {
-		if want := ep.Clients * ep.tournamentsPerBatch(); rep.Settled < want {
+	if ep.Clients > 0 || ep.PlayClients > 0 {
+		if want := ep.Clients*ep.tournamentsPerBatch() + ep.PlayClients; rep.Settled < want {
 			t.Fatalf("settled %d tournaments, want at least %d\nreplay: %s", rep.Settled, want, replay(t, p))
 		}
-		if rep.Marks["client.settled"] != rep.Settled {
-			t.Fatalf("clients saw %d settlements, checker saw %d settled tournaments\nreplay: %s", rep.Marks["client.settled"], rep.Settled, replay(t, p))
+		if seen := rep.Marks["client.settled"] + rep.Marks["play.settled"]; seen != rep.Settled {
+			t.Fatalf("clients saw %d settlements, checker saw %d settled tournaments\nreplay: %s", seen, rep.Settled, replay(t, p))
 		}
 	}
 	for _, inv := range Invariants {
 		switch {
-		case ep.Clients == 0:
+		case ep.Clients == 0 && ep.PlayClients == 0:
 			continue
+		case strings.HasPrefix(inv.ID, "P") && ep.PlayClients == 0:
+			continue // play invariants need play commands
 		case inv.ID == "S5" && rep.Crashes == 0:
 			continue // durability is checked at restarts only
 		case inv.ID == "S7" && rep.ReadsCompleted == 0:
@@ -175,10 +177,57 @@ func checkScenario(t *testing.T, name string, rep Report) {
 		if rep.Marks["checker.withheld_payouts"] == 0 {
 			t.Errorf("no payout was withheld under the settlement-time list")
 		}
+	case "duplicate_intents_after_leader_change":
+		requireMarks(t, rep, "dup.leader_crashes", "play.resends", "play.claims", "play.claims_refused_again")
+		if rep.Replays == 0 {
+			t.Errorf("no resent play intent was answered from the results table")
+		}
+	case "stale_sequence_replay":
+		requireMarks(t, rep, "stale.stale_sent", "stale.gap_sent", "stale.replay_sent")
+		for _, kind := range []string{"stale", "gap", "replay"} {
+			if sent, answered := rep.Marks["stale."+kind+"_sent"], rep.Marks["stale."+kind+"_answered"]; sent != answered {
+				t.Errorf("%d %s requests sent, %d answered", sent, kind, answered)
+			}
+		}
+		if rep.Partitions == 0 {
+			t.Errorf("no partition was installed")
+		}
+	case "partition_during_payout_claim":
+		requireMarks(t, rep, "claim_partition.splits", "play.claims", "play.claims_refused_again")
+	case "token_expiry_mid_round":
+		requireMarks(t, rep, "play.suspended", "play.session_expired", "play.session_replay_expired", "play.session_renewed", "expiry.leader_crashes")
+	case "deal_during_leader_change":
+		requireMarks(t, rep, "deal_change.leader_crashes")
+	}
+	if isPlayScenario(name) {
+		requireMarks(t, rep, "play.settled", "play.round_reads")
+		if name != "token_expiry_mid_round" { // four players and a few moves: often no illegal one
+			requireMarks(t, rep, "play.illegal_rejected")
+		}
 	}
 	if rep.ReadsCompleted == 0 {
 		t.Errorf("no consistent read completed")
 	}
+}
+
+// requireMarks reports every named scenario counter that stayed zero.
+func requireMarks(t *testing.T, rep Report, names ...string) {
+	t.Helper()
+	for _, name := range names {
+		if rep.Marks[name] == 0 {
+			t.Errorf("mark %s is zero (marks %v)", name, rep.Marks)
+		}
+	}
+}
+
+// isPlayScenario reports whether the scenario runs play clients.
+func isPlayScenario(name string) bool {
+	for _, s := range playScenarios {
+		if s.name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func TestScenarios(t *testing.T) {
@@ -348,10 +397,17 @@ func TestSeedCorpus(t *testing.T) {
 }
 
 func TestReplayDeterministic(t *testing.T) {
+	for _, scenario := range []string{"", "stale_sequence_replay"} {
+		t.Run("scenario="+scenario, func(t *testing.T) { testReplayDeterministic(t, scenario) })
+	}
+}
+
+func testReplayDeterministic(t *testing.T, scenario string) {
 	run := func() ([]byte, Report) {
 		var buf bytes.Buffer
 		p := DefaultParams(11)
 		p.Steps = 3000
+		p.Scenario = scenario
 		r, err := New(p, &buf)
 		if err != nil {
 			t.Fatal(err)
@@ -416,15 +472,17 @@ func TestParamsValidate(t *testing.T) {
 func TestScenariosListed(t *testing.T) {
 	want := []string{"leader_crash_mid_settlement", "dueling_leaders", "partition_and_heal",
 		"duplicated_and_reordered_messages", "client_retry_storm", "crash_restart_storm", "clock_skew",
-		"late_learner", "exclusion_change_at_settle"}
+		"late_learner", "exclusion_change_at_settle", "duplicate_intents_after_leader_change",
+		"stale_sequence_replay", "partition_during_payout_claim", "token_expiry_mid_round",
+		"deal_during_leader_change"}
 	if got := Scenarios(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("Scenarios() = %v, want %v", got, want)
 	}
 	if findScenario("nope") != nil {
 		t.Error("findScenario returned a scenario for an unknown name")
 	}
-	if len(Invariants) != 14 {
-		t.Errorf("Invariants lists %d entries, want S1-S8 and D1-D6", len(Invariants))
+	if len(Invariants) != 20 {
+		t.Errorf("Invariants lists %d entries, want S1-S8, D1-D6 and P1-P6", len(Invariants))
 	}
 }
 

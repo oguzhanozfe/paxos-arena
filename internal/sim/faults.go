@@ -93,6 +93,11 @@ func (r *Run) crash(nd *simNode, reason string) {
 			c.target = 0
 		}
 	}
+	for _, c := range r.playClients {
+		if c.target == nd.id {
+			c.target = 0
+		}
+	}
 	delay := r.p.RestartAfter[0] + r.jitter(r.p.RestartAfter[1]-r.p.RestartAfter[0])
 	r.schedule(event{at: r.clock + delay, kind: evRestart, node: r.index(nd), gen: nd.gen})
 }
@@ -172,6 +177,9 @@ func (r *Run) healWith(core map[paxos.NodeID]bool) {
 		}
 	}
 	for _, c := range r.clients {
+		c.target = 0
+	}
+	for _, c := range r.playClients {
 		c.target = 0
 	}
 	r.tracef("heal (core %v)", core)

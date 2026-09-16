@@ -26,12 +26,15 @@ type nodeRecord struct {
 	// it produced per key (S8).
 	results     map[tournament.IdempotencyKey]tournament.Result
 	nonReplayed map[tournament.IdempotencyKey]int
+	// play is the play accounting of this incarnation (P2).
+	play *playNodeRecord
 }
 
 func newNodeRecord() *nodeRecord {
 	return &nodeRecord{
 		results:     make(map[tournament.IdempotencyKey]tournament.Result),
 		nonReplayed: make(map[tournament.IdempotencyKey]int),
+		play:        newPlayNodeRecord(),
 	}
 }
 
@@ -40,6 +43,7 @@ func newNodeRecord() *nodeRecord {
 func (rec *nodeRecord) resetState() {
 	rec.results = make(map[tournament.IdempotencyKey]tournament.Result)
 	rec.nonReplayed = make(map[tournament.IdempotencyKey]int)
+	rec.play = newPlayNodeRecord()
 }
 
 type slotValue struct {
@@ -57,6 +61,9 @@ type ballotSlot struct {
 type applySnapshot struct {
 	mutations uint64
 	recorded  int
+	events    int
+	postings  int
+	clock     int64
 }
 
 // settledSnapshot is the replicated part of a tournament at the moment its
@@ -339,7 +346,7 @@ func (c *Checker) recordChosen(r *Run, nd *simNode, s paxos.Slot, e replog.Entry
 // beforeApply snapshots the state-machine counters before one application.
 func (c *Checker) beforeApply(nd *simNode) applySnapshot {
 	st := nd.core.State()
-	return applySnapshot{mutations: st.Mutations(), recorded: st.Recorded()}
+	return applySnapshot{mutations: st.Mutations(), recorded: st.Recorded(), events: st.EventCount(), postings: st.Ledger().Len(), clock: st.Clock()}
 }
 
 // observeApply checks one applied slot: the chosen record and the state
@@ -431,6 +438,7 @@ func (c *Checker) observeApply(r *Run, nd *simNode, a replica.Applied, snap appl
 		}
 	}
 	c.checkTournament(r, nd, st, tid)
+	c.checkPlayApply(r, nd, st, a, snap)
 	c.count("D6")
 	if err := st.Ledger().CheckBalances(); err != nil {
 		c.fail(r, "D6", "node %d after slot %d: %v", nd.id, a.Slot, err)
@@ -678,13 +686,28 @@ func (c *Checker) observeReadReady(r *Run, nd *simNode, pr pendingRead, index pa
 func (c *Checker) AfterEvent(r *Run) error { return c.err }
 
 // AtEnd replays the chosen prefix into a fresh state machine and compares
-// its hashes with those every node produced (S2), checks every live node's
-// chosen prefix against the record (S1), sweeps every tournament on every
-// live node (D1 to D6), and requires every node that has applied a key to
-// hold exactly one result for it (S8).
+// its hashes with those every node produced (S2), requires live nodes that
+// applied the same slot to hold the same state hash (S2), checks every live
+// node's chosen prefix against the record (S1), sweeps every tournament on
+// every live node (D1 to D6, and P1, P4 and P5 for play tournaments), and
+// requires every node that has applied a key to hold exactly one result for
+// it (S8).
 func (c *Checker) AtEnd(r *Run) error {
 	if c.err != nil {
 		return c.err
+	}
+	hashes := make(map[paxos.Slot][32]byte)
+	for _, nd := range r.nodes {
+		if !nd.alive {
+			continue
+		}
+		st := nd.core.State()
+		c.count("S2")
+		if h, ok := hashes[st.Applied()]; ok && h != st.Hash() {
+			c.fail(r, "S2", "node %d ends at applied slot %d with a state hash that differs from another node's at that slot", nd.id, st.Applied())
+			return c.err
+		}
+		hashes[st.Applied()] = st.Hash()
 	}
 	st := tournament.NewState()
 	for s := paxos.Slot(1); ; s++ {
@@ -729,6 +752,10 @@ func (c *Checker) AtEnd(r *Run) error {
 			if c.err != nil {
 				return c.err
 			}
+		}
+		c.checkPlayAtEnd(r, nd, state)
+		if c.err != nil {
+			return c.err
 		}
 		c.count("D6")
 		if err := state.Ledger().Check(); err != nil {
