@@ -35,7 +35,7 @@ type fakeBackend struct {
 }
 
 func newFake() *fakeBackend {
-	return &fakeBackend{state: tournament.New(), status: replica.Status{Self: 1, Leader: 1, Role: replog.Leader, Ready: true}}
+	return &fakeBackend{state: tournament.NewState(), status: replica.Status{Self: 1, Leader: 1, Role: replog.Leader, Ready: true}}
 }
 
 func (f *fakeBackend) Submit(ctx context.Context, cmd tournament.Command) (tournament.Result, error) {
@@ -69,7 +69,7 @@ func (f *fakeBackend) Read(ctx context.Context, consistent bool, fn func(*tourna
 	defer f.mu.Unlock()
 	f.reads = append(f.reads, consistent)
 	if consistent && f.status.Role != replog.Leader {
-		return replog.ErrNotLeader{Leader: f.status.Leader}
+		return replog.NotLeaderError{Leader: f.status.Leader}
 	}
 	return fn(f.state)
 }
@@ -341,7 +341,7 @@ func TestForwarding(t *testing.T) {
 
 	f := newFake()
 	f.setStatus(replica.Status{Self: 1, Leader: 2, Role: replog.Follower})
-	f.submitErr = replog.ErrNotLeader{Leader: 2}
+	f.submitErr = replog.NotLeaderError{Leader: 2}
 	h := newServer(t, f, func(c *Config) { c.Peers = map[paxos.NodeID]string{1: "http://self", 2: leader.URL} })
 
 	rec := do(h, "POST", "/v1/tournaments/t1/entries?x=1", "fwd-key", `{"player":{"id":"p","jurisdiction":"TR","age":30}}`)
@@ -386,7 +386,7 @@ func TestForwarding(t *testing.T) {
 
 	// Unknown leader: 503 with Retry-After, no forward.
 	f.setStatus(replica.Status{Self: 1, Leader: 0, Role: replog.Follower})
-	f.submitErr = replog.ErrNotLeader{}
+	f.submitErr = replog.NotLeaderError{}
 	rec = do(h, "POST", "/v1/tournaments", "k3", createBody)
 	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") != "1" {
 		t.Fatalf("unknown leader = %d", rec.Code)
@@ -445,7 +445,71 @@ func TestDefaultSeedIsRandom(t *testing.T) {
 	if a == b {
 		t.Error("two default seeds are equal")
 	}
-	if cfg.RequestTimeout != 5*time.Second || cfg.MaxBody != 1<<20 || cfg.Client == nil || cfg.Now == nil {
+	if cfg.RequestTimeout != 5*time.Second || cfg.MaxBody != DefaultMaxBody || cfg.Client == nil || cfg.Now == nil {
 		t.Errorf("defaults: %+v", cfg)
+	}
+}
+
+// TestCommandTooLargeForTheLog: with MaxBody raised above the log's limit,
+// a body within MaxBody whose canonical encoding exceeds
+// replog.MaxValueBytes (JSON escapes a '<' as six bytes) is refused with
+// 413 before anything is proposed, because the log would refuse the value.
+func TestCommandTooLargeForTheLog(t *testing.T) {
+	f := newFake()
+	h := newServer(t, f, func(c *Config) { c.MaxBody = 8 << 20 })
+	id := strings.Repeat("<", replog.MaxValueBytes/5)
+	body := strings.Replace(createBody, `"id":"t1"`, `"id":"`+id+`"`, 1)
+	if len(body) > replog.MaxValueBytes {
+		t.Fatalf("setup: body of %d bytes is not below the log's limit", len(body))
+	}
+	rec := do(h, "POST", "/v1/tournaments", "big", body)
+	if p := problemOf(t, rec); rec.Code != http.StatusRequestEntityTooLarge || p.Code != CodeBodyTooLarge || !strings.Contains(p.Detail, "encodes to") {
+		t.Fatalf("oversized command = %d %+v", rec.Code, p)
+	}
+	if f.slot != 0 {
+		t.Fatalf("the oversized command was submitted (slot %d)", f.slot)
+	}
+}
+
+// TestResponsesRenderEmptyListsAsArrays: a new tournament has no entries,
+// standings or payouts; the API renders them as [] rather than null, and
+// /v1/node renders the state hash as hex.
+func TestResponsesRenderEmptyListsAsArrays(t *testing.T) {
+	f := newFake()
+	f.status.StateHash = tournament.Digest{0xab, 0x01}
+	h := newServer(t, f, nil)
+	noExclusions := strings.Replace(createBody, `"jurisdictions":["XX"]`, `"jurisdictions":[]`, 1)
+	for _, rec := range []*httptest.ResponseRecorder{
+		do(h, "POST", "/v1/tournaments", "c1", noExclusions),
+		do(h, "GET", "/v1/tournaments/t1", "", ""),
+	} {
+		if rec.Code != http.StatusCreated && rec.Code != http.StatusOK {
+			t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+		}
+		body := rec.Body.String()
+		if strings.Contains(body, "null") {
+			t.Errorf("response renders null: %s", body)
+		}
+		for _, field := range []string{`"entries": []`, `"standings": []`, `"payouts": []`, `"jurisdictions": []`} {
+			if !strings.Contains(body, field) {
+				t.Errorf("response lacks %s: %s", field, body)
+			}
+		}
+	}
+	rec := do(h, "GET", "/v1/node", "", "")
+	if want := `"state_hash": "ab01` + strings.Repeat("00", 30) + `"`; !strings.Contains(rec.Body.String(), want) {
+		t.Errorf("/v1/node lacks %s: %s", want, rec.Body.String())
+	}
+}
+
+// TestBusyLeaderAnswers503: a leader whose proposal queue is full refuses
+// the command with 503 and Retry-After, and the client may retry the key.
+func TestBusyLeaderAnswers503(t *testing.T) {
+	f := newFake()
+	f.submitErr = replog.ErrBusy
+	h := newServer(t, f, nil)
+	rec := do(h, "POST", "/v1/tournaments", "c1", createBody)
+	if p := problemOf(t, rec); rec.Code != http.StatusServiceUnavailable || p.Code != CodeUnavailable || rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("busy leader = %d %+v, Retry-After %q", rec.Code, p, rec.Header().Get("Retry-After"))
 	}
 }

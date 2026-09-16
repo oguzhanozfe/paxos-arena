@@ -147,12 +147,17 @@ func (p Params) Validate() error {
 	if p.Steps < 0 || p.LivenessSteps < 0 {
 		return errors.New("sim: Steps and LivenessSteps must not be negative")
 	}
-	for name, v := range map[string]float64{
-		"DropP": p.Faults.DropP, "DupP": p.Faults.DupP, "PartitionP": p.PartitionP,
-		"HealP": p.HealP, "CrashP": p.CrashP, "TornWriteP": p.TornWriteP, "RetryP": p.RetryP,
+	// A slice, not a map, so that the first field reported is always the
+	// same one.
+	for _, f := range []struct {
+		name string
+		v    float64
+	}{
+		{"DropP", p.Faults.DropP}, {"DupP", p.Faults.DupP}, {"PartitionP", p.PartitionP},
+		{"HealP", p.HealP}, {"CrashP", p.CrashP}, {"TornWriteP", p.TornWriteP}, {"RetryP", p.RetryP},
 	} {
-		if v < 0 || v > 1 {
-			return fmt.Errorf("sim: %s = %v is not a probability", name, v)
+		if f.v < 0 || f.v > 1 {
+			return fmt.Errorf("sim: %s = %v is not a probability", f.name, f.v)
 		}
 	}
 	if p.Faults.MinDelay < 0 || p.Faults.MaxDelay < p.Faults.MinDelay {

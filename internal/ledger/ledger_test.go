@@ -164,6 +164,20 @@ func TestCheck(t *testing.T) {
 	if err := corrupt.Check(); err == nil || !strings.Contains(err.Error(), "twice") {
 		t.Errorf("Check on duplicate keys = %v, want a duplicate error", err)
 	}
+	// Balances that still sum to zero but disagree with the postings.
+	corrupt = NewBook()
+	corrupt.Post(fee("t1", "p1", 100))
+	corrupt.balances[PoolAccount("t1")] -= 40
+	corrupt.balances[RakeAccount("t1")] += 40
+	if err := corrupt.Check(); err == nil || !strings.Contains(err.Error(), "postings give") {
+		t.Errorf("Check on moved balances = %v, want a recomputation error", err)
+	}
+	corrupt = NewBook()
+	corrupt.Post(fee("t1", "p1", 100))
+	corrupt.postings[0].Amount = 60
+	if err := corrupt.Check(); err == nil || !strings.Contains(err.Error(), "postings give") {
+		t.Errorf("Check on an edited amount = %v, want a recomputation error", err)
+	}
 	corrupt = NewBook()
 	corrupt.Post(fee("t1", "p1", 100))
 	corrupt.postings[0].Seq = 7

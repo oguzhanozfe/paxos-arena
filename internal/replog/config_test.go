@@ -17,7 +17,7 @@ func TestConfigValidate(t *testing.T) {
 		{"defaults", func(*Config) {}, false},
 		{"zero timing fields take defaults", func(c *Config) {
 			c.HeartbeatInterval, c.ElectionTimeoutMin, c.ElectionTimeoutMax = 0, 0, 0
-			c.Window, c.LearnBatch = 0, 0
+			c.Window, c.LearnBatch, c.QueueLimit = 0, 0, 0
 		}, false},
 		{"lease disabled", func(c *Config) { c.LeaseDuration = 0 }, false},
 		{"single node", func(c *Config) { c.Peers = []paxos.NodeID{1} }, false},
@@ -33,6 +33,7 @@ func TestConfigValidate(t *testing.T) {
 		{"negative lease", func(c *Config) { c.LeaseDuration = -time.Millisecond }, true},
 		{"negative window", func(c *Config) { c.Window = -1 }, true},
 		{"negative learn batch", func(c *Config) { c.LearnBatch = -1 }, true},
+		{"negative queue limit", func(c *Config) { c.QueueLimit = -1 }, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 
+	"github.com/oguzhanozfe/paxos-arena/internal/jsonx"
 	"github.com/oguzhanozfe/paxos-arena/internal/paxos"
 )
 
@@ -93,21 +93,6 @@ func Decode(b []byte) (Envelope, error) {
 	return env, nil
 }
 
-// strictUnmarshal decodes exactly one JSON value into v, rejecting unknown
-// fields and any non-whitespace after the value.
-func strictUnmarshal(b []byte, v any) error {
-	s := string(b)
-	dec := json.NewDecoder(strings.NewReader(s))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(v); err != nil {
-		return err
-	}
-	off := dec.InputOffset()
-	if off < 0 || int(off) > len(s) {
-		return errors.New("decoder offset out of range")
-	}
-	if strings.TrimSpace(s[off:]) != "" {
-		return errors.New("trailing data after JSON value")
-	}
-	return nil
-}
+// strictUnmarshal is jsonx.DecodeStrict: one JSON value, no unknown
+// fields, nothing but whitespace after it.
+func strictUnmarshal(b []byte, v any) error { return jsonx.DecodeStrict(b, v) }

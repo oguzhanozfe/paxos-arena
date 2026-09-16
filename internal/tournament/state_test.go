@@ -21,7 +21,7 @@ type driver struct {
 }
 
 func newDriver(t *testing.T) *driver {
-	return &driver{t: t, s: New(), b: paxos.Ballot{Round: 1, Node: 1}}
+	return &driver{t: t, s: NewState(), b: paxos.Ballot{Round: 1, Node: 1}}
 }
 
 func (d *driver) key() IdempotencyKey {
@@ -521,7 +521,7 @@ func TestKeyReusedWithDifferentPayload(t *testing.T) {
 }
 
 func TestApplyKeyAndOrderGuards(t *testing.T) {
-	s := New()
+	s := NewState()
 	b := paxos.Ballot{Round: 1, Node: 1}
 	if r := s.Apply(1, b, Command{Key: "", Op: Close{Tournament: "t"}}); r.Code != InvalidKey {
 		t.Errorf("empty key = %s", r.Code)
@@ -647,7 +647,7 @@ func TestReplayDeterministic(t *testing.T) {
 			cmds[i].Op = op
 		}
 	}
-	a, b := New(), New()
+	a, b := NewState(), NewState()
 	ballot := paxos.Ballot{Round: 2, Node: 1}
 	var hashes [][32]byte
 	oks, rejects := 0, 0
@@ -681,7 +681,7 @@ func TestReplayDeterministic(t *testing.T) {
 		t.Fatalf("workflow exercised %d successes and %d rejections", oks, rejects)
 	}
 	// Replay from a fresh state through the encoded form.
-	c := New()
+	c := NewState()
 	for i, cmd := range cmds {
 		slot := paxos.Slot(i + 1)
 		if slot%7 == 0 {
@@ -714,7 +714,7 @@ func TestReplayDeterministic(t *testing.T) {
 	// The ballot is per-replica audit metadata: a replica that learned the
 	// same slots under other ballots holds the same replicated state and
 	// the same hash, while its records carry its own ballots.
-	d := New()
+	d := NewState()
 	other := paxos.Ballot{Round: 3, Node: 2}
 	for i, cmd := range cmds {
 		slot := paxos.Slot(i + 1)

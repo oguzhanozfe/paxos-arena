@@ -165,19 +165,27 @@ func (n *Node) Tick(now time.Duration) []Envelope {
 }
 
 // Propose asks the leader to place v in the next free slot. It returns
-// ErrNotLeader when this node is not the leader. Once Window slots are in
-// flight, v is queued and proposed when a slot is chosen. A proposed value
-// that loses its slot to another leader's value is not re-proposed by the
-// log; the client's retry does that.
+// NotLeaderError when this node is not the leader and ErrValueTooLarge (wrapped)
+// for a value longer than MaxValueBytes. Once Window slots are in flight, v
+// is queued and proposed when a slot is chosen; ErrBusy is returned when
+// QueueLimit values are queued already. A proposed value that loses its slot
+// to another leader's value is not re-proposed by the log; the client's retry
+// does that.
 func (n *Node) Propose(now time.Duration, v paxos.Value) ([]Envelope, error) {
 	if n.failed != nil {
 		return nil, n.failed
 	}
 	n.begin(now)
+	if len(v) > MaxValueBytes {
+		return nil, fmt.Errorf("%w: %d bytes, limit %d", ErrValueTooLarge, len(v), MaxValueBytes)
+	}
 	if n.role != Leader {
-		return nil, ErrNotLeader{Leader: n.leaderHint}
+		return nil, NotLeaderError{Leader: n.leaderHint}
 	}
 	if len(n.proposals) >= n.cfg.Window {
+		if len(n.queue) >= n.cfg.QueueLimit {
+			return n.finish(), ErrBusy
+		}
 		n.queue = append(n.queue, v)
 	} else {
 		n.propose(now, n.nextSlot, v)
@@ -190,7 +198,7 @@ func (n *Node) Propose(now time.Duration, v paxos.Value) ([]Envelope, error) {
 // current commit index under a new sequence number and sends a Heartbeat
 // carrying it. ReadReady{seq, index} is emitted when a quorum acknowledges
 // at the leader's ballot; ReadFailed{seq} when leadership is lost first. It
-// returns ErrNotLeader on a non-leader and ErrNotReady until the leadership
+// returns NotLeaderError on a non-leader and ErrNotReady until the leadership
 // no-op is chosen.
 func (n *Node) ReadIndex(now time.Duration) (seq uint64, out []Envelope, err error) {
 	if n.failed != nil {
@@ -198,7 +206,7 @@ func (n *Node) ReadIndex(now time.Duration) (seq uint64, out []Envelope, err err
 	}
 	n.begin(now)
 	if n.role != Leader {
-		return 0, nil, ErrNotLeader{Leader: n.leaderHint}
+		return 0, nil, NotLeaderError{Leader: n.leaderHint}
 	}
 	if !n.Ready() {
 		return 0, nil, ErrNotReady
@@ -788,12 +796,12 @@ func (n *Node) onHeartbeatAck(now time.Duration, from paxos.NodeID, m HeartbeatA
 }
 
 // stepDown returns the node to Follower. Pending reads fail with
-// ErrNotLeader; pending proposals and queued values are dropped (the host
+// NotLeaderError; pending proposals and queued values are dropped (the host
 // fails pending submits with its own error). The next election is delayed
 // by wait, the lease time a Nack reported.
 func (n *Node) stepDown(now time.Duration, leader paxos.NodeID, lb paxos.Ballot, wait time.Duration) {
 	for _, seq := range sortedSeqs(n.reads) {
-		n.emit(ReadFailed{Seq: seq, Err: ErrNotLeader{Leader: leader}})
+		n.emit(ReadFailed{Seq: seq, Err: NotLeaderError{Leader: leader}})
 	}
 	n.role = Follower
 	n.proposals = make(map[paxos.Slot]*proposal)

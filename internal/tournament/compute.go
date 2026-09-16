@@ -68,7 +68,11 @@ func ComputePool(t *Tournament) (fees, rake, pool ledger.Money) {
 // pool * PrizeBps[i] / 10000 with the rounding remainder added to first
 // place; under Split the shares of a group of equal scores are pooled and
 // divided equally, the remainder going one unit each to the earliest
-// submitters; a payout whose player's jurisdiction is on ex is marked
+// submitters. A tie group is cut off at the last prize place: with three
+// places and scores 100, 90, 80, 80, the two entrants on 80 both stand in
+// place 3, but only the earlier submitter is inside the three paid places
+// and receives the third share, and the other receives nothing. A payout
+// whose player's jurisdiction is on ex is marked
 // Withheld. The amounts always sum to the pool (or to the fees when
 // voided).
 func ComputePayouts(t *Tournament, ex Exclusions) []Payout {

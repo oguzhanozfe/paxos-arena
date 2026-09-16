@@ -30,16 +30,27 @@ type submitReply struct {
 	err error
 }
 
-type submitReq struct {
-	cmd   tournament.Command
-	reply chan submitReply
+// waiter is one Submit waiting for its key to be applied. fp is the
+// fingerprint of its command: a waiter is only given the result of a command
+// with the same fingerprint. abandoned is set by Submit when its context
+// ends, so the event loop can forget the waiter.
+type waiter struct {
+	cmd       tournament.Command
+	fp        [32]byte
+	reply     chan submitReply
+	abandoned atomic.Bool
 }
 
+// readReq is one Read. abandoned is set by Read when its context ends, so
+// the event loop skips fn. fn may still be running, or run later, when Read
+// has already returned ctx.Err(): a caller must not use anything fn writes
+// unless Read returned nil.
 type readReq struct {
 	consistent bool
 	fn         func(*tournament.State) error
 	reply      chan error
 	index      paxos.Slot
+	abandoned  atomic.Bool
 }
 
 // Runner is the one goroutine per process that owns a Core. Transport
@@ -54,14 +65,16 @@ type Runner struct {
 	start time.Time
 
 	inbox   chan replog.Envelope
-	submits chan submitReq
-	reads   chan readReq
+	submits chan *waiter
+	reads   chan *readReq
 	done    chan struct{}
 	dropped atomic.Uint64
 
-	waiters      map[tournament.IdempotencyKey][]chan submitReply
+	waiters      map[tournament.IdempotencyKey][]*waiter
+	nwaiters     int // total length of the waiters lists
 	pendingReads map[uint64]*readReq
 	applyWaits   []*readReq
+	held         atomic.Int64 // requests held, as of the last event
 
 	mu     sync.RWMutex
 	status Status
@@ -79,10 +92,10 @@ func NewRunner(core *Core, send func(replog.Envelope), log *slog.Logger) *Runner
 		log:          log.With("node", core.Log().Self()),
 		tick:         core.Log().Config().HeartbeatInterval / 2,
 		inbox:        make(chan replog.Envelope, InboxSize),
-		submits:      make(chan submitReq),
-		reads:        make(chan readReq),
+		submits:      make(chan *waiter),
+		reads:        make(chan *readReq),
 		done:         make(chan struct{}),
-		waiters:      make(map[tournament.IdempotencyKey][]chan submitReply),
+		waiters:      make(map[tournament.IdempotencyKey][]*waiter),
 		pendingReads: make(map[uint64]*readReq),
 	}
 	r.status = core.Status()
@@ -113,6 +126,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		case env := <-r.inbox:
 			r.after(r.core.Step(r.now(), env))
 		case <-ticker.C:
+			r.sweepAbandoned()
 			r.after(r.core.Tick(r.now()))
 		case req := <-r.submits:
 			r.handleSubmit(req)
@@ -138,25 +152,30 @@ func (r *Runner) Deliver(env replog.Envelope) {
 }
 
 // Submit proposes cmd and waits until the local state machine applies a
-// command with cmd's key, from whichever slot. It returns
-// replog.ErrNotLeader at once when this replica does not lead, unless the
-// key's result is already recorded locally, in which case that result is
-// returned with Replayed set. It returns ErrLeadershipLost when leadership
-// changes before the key is applied, and ctx.Err() when ctx ends first (the
-// command may still be applied later).
+// command with cmd's key, from whichever slot. When the command applied
+// under the key has the same fingerprint as cmd, its result is returned;
+// when it has a different one, cmd is answered as its own application would
+// be, with tournament.KeyReused. It returns replog.NotLeaderError at once
+// when this replica does not lead, unless the key's result is already
+// recorded locally, in which case that result is returned with Replayed set;
+// replog.ErrBusy when the leader's proposal queue is full; and
+// ErrLeadershipLost when leadership changes before the key is applied. It
+// returns ctx.Err() when ctx ends first; the command may still be applied
+// later, and the runner forgets the wait at its next tick.
 func (r *Runner) Submit(ctx context.Context, cmd tournament.Command) (tournament.Result, error) {
-	req := submitReq{cmd: cmd, reply: make(chan submitReply, 1)}
+	w := &waiter{cmd: cmd, reply: make(chan submitReply, 1)}
 	select {
-	case r.submits <- req:
+	case r.submits <- w:
 	case <-ctx.Done():
 		return tournament.Result{}, ctx.Err()
 	case <-r.done:
 		return tournament.Result{}, ErrStopped
 	}
 	select {
-	case rep := <-req.reply:
+	case rep := <-w.reply:
 		return rep.res, rep.err
 	case <-ctx.Done():
+		w.abandoned.Store(true)
 		return tournament.Result{}, ctx.Err()
 	}
 }
@@ -164,11 +183,16 @@ func (r *Runner) Submit(ctx context.Context, cmd tournament.Command) (tournament
 // Read runs fn on the event-loop goroutine against the state machine. With
 // consistent set, it first runs the read-index barrier on the leader and
 // waits until the applied slot reaches the index, so fn sees every command
-// completed before Read was called; it returns replog.ErrNotLeader or
+// completed before Read was called; it returns replog.NotLeaderError or
 // replog.ErrNotReady when the barrier cannot start. Without it, fn runs at
 // once on whatever this replica has applied. fn must not retain the state.
+//
+// When ctx ends first, Read returns ctx.Err() at once. fn may be running on
+// the event loop at that moment, or start later, so the caller must not use
+// anything fn writes unless Read returned nil; nil is returned only after fn
+// has returned.
 func (r *Runner) Read(ctx context.Context, consistent bool, fn func(*tournament.State) error) error {
-	req := readReq{consistent: consistent, fn: fn, reply: make(chan error, 1)}
+	req := &readReq{consistent: consistent, fn: fn, reply: make(chan error, 1)}
 	select {
 	case r.reads <- req:
 	case <-ctx.Done():
@@ -180,6 +204,7 @@ func (r *Runner) Read(ctx context.Context, consistent bool, fn func(*tournament.
 	case err := <-req.reply:
 		return err
 	case <-ctx.Done():
+		req.abandoned.Store(true)
 		return ctx.Err()
 	}
 }
@@ -193,22 +218,30 @@ func (r *Runner) Status() Status {
 
 // --- event-loop internals ---
 
-func (r *Runner) handleSubmit(req submitReq) {
-	if res, ok := r.core.State().Replay(req.cmd); ok {
-		req.reply <- submitReply{res: res}
+func (r *Runner) handleSubmit(w *waiter) {
+	if w.abandoned.Load() {
 		return
 	}
-	outs, err := r.core.Submit(r.now(), req.cmd)
+	if res, ok := r.core.State().Replay(w.cmd); ok {
+		w.reply <- submitReply{res: res}
+		return
+	}
+	outs, err := r.core.Submit(r.now(), w.cmd)
 	if err != nil {
-		req.reply <- submitReply{err: err}
+		w.reply <- submitReply{err: err}
 		r.after(outs)
 		return
 	}
-	r.waiters[req.cmd.Key] = append(r.waiters[req.cmd.Key], req.reply)
+	w.fp = tournament.Fingerprint(w.cmd)
+	r.waiters[w.cmd.Key] = append(r.waiters[w.cmd.Key], w)
+	r.nwaiters++
 	r.after(outs)
 }
 
-func (r *Runner) handleRead(req readReq) {
+func (r *Runner) handleRead(req *readReq) {
+	if req.abandoned.Load() {
+		return
+	}
 	if !req.consistent {
 		req.reply <- req.fn(r.core.State())
 		return
@@ -219,17 +252,63 @@ func (r *Runner) handleRead(req readReq) {
 		r.after(outs)
 		return
 	}
-	rq := req
-	r.pendingReads[seq] = &rq
+	r.pendingReads[seq] = req
 	r.after(outs)
 }
 
+// sweepAbandoned forgets every waiter and every read whose caller has
+// returned, so that a leader that cannot get slots chosen does not
+// accumulate one entry per timed-out request.
+func (r *Runner) sweepAbandoned() {
+	for key, ws := range r.waiters {
+		kept := ws[:0]
+		for _, w := range ws {
+			if !w.abandoned.Load() {
+				kept = append(kept, w)
+			}
+		}
+		r.nwaiters -= len(ws) - len(kept)
+		clear(ws[len(kept):])
+		if len(kept) == 0 {
+			delete(r.waiters, key)
+		} else {
+			r.waiters[key] = kept
+		}
+	}
+	for seq, rq := range r.pendingReads {
+		if rq.abandoned.Load() {
+			delete(r.pendingReads, seq)
+		}
+	}
+	kept := r.applyWaits[:0]
+	for _, rq := range r.applyWaits {
+		if !rq.abandoned.Load() {
+			kept = append(kept, rq)
+		}
+	}
+	clear(r.applyWaits[len(kept):])
+	r.applyWaits = kept
+	r.held.Store(int64(r.nwaiters + len(r.pendingReads) + len(r.applyWaits)))
+}
+
+// Held returns the number of Submit and consistent Read calls the event loop
+// was holding after its last event, including calls whose context has ended
+// and that the next tick will forget.
+func (r *Runner) Held() int { return int(r.held.Load()) }
+
 // after sends the core's output, reacts to its events, applies what became
-// committed and refreshes the status snapshot.
+// committed, refreshes the status snapshot, and only then answers the
+// requests the step completed, so that a caller woken here already sees the
+// new snapshot in Status.
 func (r *Runner) after(outs []replog.Envelope) {
 	for _, env := range outs {
 		r.send(env)
 	}
+	type failedRead struct {
+		rq  *readReq
+		err error
+	}
+	var failed []failedRead
 	for _, ev := range r.core.Events() {
 		switch e := ev.(type) {
 		case replog.LeaderChanged:
@@ -247,61 +326,88 @@ func (r *Runner) after(outs []replog.Envelope) {
 		case replog.ReadFailed:
 			if rq, ok := r.pendingReads[e.Seq]; ok {
 				delete(r.pendingReads, e.Seq)
-				rq.reply <- e.Err
+				failed = append(failed, failedRead{rq, e.Err})
 			}
 		case replog.LearnConflict:
 			r.log.Error("learn conflict: two values for one slot", "slot", e.Slot,
 				"have", e.Have.Ballot.String(), "got", e.Got.Ballot.String())
 		}
 	}
-	for _, a := range r.core.ApplyCommitted() {
+	applied := r.core.ApplyCommitted()
+
+	st := r.core.Status()
+	r.mu.Lock()
+	r.status = st
+	r.mu.Unlock()
+
+	for _, f := range failed {
+		f.rq.reply <- f.err
+	}
+	for _, a := range applied {
 		if a.Err != nil {
 			r.log.Warn("skipped undecodable entry", "slot", a.Slot, "err", a.Err)
 		}
 		if a.NoOp {
 			continue
 		}
-		if chans, ok := r.waiters[a.Key]; ok {
-			delete(r.waiters, a.Key)
-			for _, ch := range chans {
-				ch <- submitReply{res: a.Result}
+		ws, ok := r.waiters[a.Key]
+		if !ok {
+			continue
+		}
+		delete(r.waiters, a.Key)
+		r.nwaiters -= len(ws)
+		fp := tournament.Fingerprint(a.Command)
+		for _, w := range ws {
+			if w.fp == fp {
+				w.reply <- submitReply{res: a.Result}
+				continue
+			}
+			// Same key, different command: the key is now recorded for the
+			// command that was applied, and this one is answered as its own
+			// application will be.
+			if res, recorded := r.core.State().Replay(w.cmd); recorded {
+				w.reply <- submitReply{res: res}
+			} else {
+				r.waiters[a.Key] = append(r.waiters[a.Key], w)
+				r.nwaiters++
 			}
 		}
 	}
-	if len(r.waiters) > 0 && r.core.Log().Role() != replog.Leader {
-		for key, chans := range r.waiters {
-			for _, ch := range chans {
-				ch <- submitReply{err: ErrLeadershipLost}
+	if len(r.waiters) > 0 && st.Role != replog.Leader {
+		for key, ws := range r.waiters {
+			for _, w := range ws {
+				w.reply <- submitReply{err: ErrLeadershipLost}
 			}
 			delete(r.waiters, key)
 		}
+		r.nwaiters = 0
 	}
 	if len(r.applyWaits) > 0 {
-		applied := r.core.State().Applied()
 		kept := r.applyWaits[:0]
 		for _, rq := range r.applyWaits {
-			if applied >= rq.index {
+			switch {
+			case rq.abandoned.Load():
+			case st.Applied >= rq.index:
 				rq.reply <- rq.fn(r.core.State())
-			} else {
+			default:
 				kept = append(kept, rq)
 			}
 		}
+		clear(r.applyWaits[len(kept):])
 		r.applyWaits = kept
 	}
-	st := r.core.Status()
-	r.mu.Lock()
-	r.status = st
-	r.mu.Unlock()
+	r.held.Store(int64(r.nwaiters + len(r.pendingReads) + len(r.applyWaits)))
 }
 
 // failAll answers every pending request with err.
 func (r *Runner) failAll(err error) {
-	for key, chans := range r.waiters {
-		for _, ch := range chans {
-			ch <- submitReply{err: err}
+	for key, ws := range r.waiters {
+		for _, w := range ws {
+			w.reply <- submitReply{err: err}
 		}
 		delete(r.waiters, key)
 	}
+	r.nwaiters = 0
 	for seq, rq := range r.pendingReads {
 		rq.reply <- err
 		delete(r.pendingReads, seq)
@@ -310,4 +416,5 @@ func (r *Runner) failAll(err error) {
 		rq.reply <- err
 	}
 	r.applyWaits = nil
+	r.held.Store(0)
 }

@@ -10,7 +10,8 @@ import (
 const modulePath = "github.com/oguzhanozfe/paxos-arena"
 
 // allowedDirectImports is the set the design permits in the domain core:
-// a short list of standard packages plus the packages below it.
+// a short list of standard packages plus the packages below it
+// (internal/jsonx is the strict JSON decoder every layer shares).
 // encoding/hex renders the input digest the design specifies as hex.
 var allowedDirectImports = map[string]bool{
 	"encoding/json":                 true,
@@ -23,6 +24,7 @@ var allowedDirectImports = map[string]bool{
 	"strings":                       true,
 	"time":                          true,
 	"math/rand/v2":                  true,
+	modulePath + "/internal/jsonx":  true,
 	modulePath + "/internal/paxos":  true,
 	modulePath + "/internal/ledger": true,
 }
@@ -30,13 +32,14 @@ var allowedDirectImports = map[string]bool{
 // allowedModuleDeps is the closure of module packages the domain core may
 // depend on, directly or transitively.
 var allowedModuleDeps = map[string]bool{
+	modulePath + "/internal/jsonx":      true,
 	modulePath + "/internal/paxos":      true,
 	modulePath + "/internal/ledger":     true,
 	modulePath + "/internal/tournament": true,
 }
 
 // TestNoForbiddenImports enforces the dependency direction of the design
-// for ledger and tournament: paxos <- ledger <- tournament, with no import
+// for ledger and tournament: jsonx, paxos <- ledger <- tournament, with no import
 // of replog, transport, replica, api or sim.
 func TestNoForbiddenImports(t *testing.T) {
 	goBin, err := exec.LookPath("go")

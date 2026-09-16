@@ -677,7 +677,7 @@ func (c *Checker) AtEnd(r *Run) error {
 	if c.err != nil {
 		return c.err
 	}
-	st := tournament.New()
+	st := tournament.NewState()
 	for s := paxos.Slot(1); ; s++ {
 		v, ok := c.chosen[s]
 		if !ok {

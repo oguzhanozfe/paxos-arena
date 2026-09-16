@@ -205,7 +205,7 @@ type ReadReady struct {
 type ReadFailed struct {
 	// Seq is the sequence number ReadIndex returned.
 	Seq uint64
-	// Err is the reason, an ErrNotLeader naming the new leader if known.
+	// Err is the reason, a NotLeaderError naming the new leader if known.
 	Err error
 }
 
@@ -227,15 +227,15 @@ func (ReadReady) event()     {}
 func (ReadFailed) event()    {}
 func (LearnConflict) event() {}
 
-// ErrNotLeader is returned by Propose and ReadIndex on a node that is not
+// NotLeaderError is returned by Propose and ReadIndex on a node that is not
 // the leader. Leader is the leader this node knows about, 0 when unknown.
-type ErrNotLeader struct {
+type NotLeaderError struct {
 	// Leader is the node believed to lead, or 0.
 	Leader paxos.NodeID
 }
 
 // Error implements error.
-func (e ErrNotLeader) Error() string {
+func (e NotLeaderError) Error() string {
 	if e.Leader == 0 {
 		return "replog: not the leader (leader unknown)"
 	}
@@ -244,4 +244,14 @@ func (e ErrNotLeader) Error() string {
 
 // ErrNotReady is returned by ReadIndex while the leader's leadership no-op
 // is not yet chosen, so its commit index may not cover every earlier ballot.
+// It is unrelated to paxos.ErrNoQuorum of the single-decree proposer.
 var ErrNotReady = errors.New("replog: leader has not committed its leadership no-op")
+
+// ErrBusy is returned by Propose when Window slots are in flight and
+// QueueLimit values are already queued. Nothing was proposed; the caller may
+// retry later.
+var ErrBusy = errors.New("replog: the leader's proposal queue is full")
+
+// ErrValueTooLarge is returned, wrapped with the sizes, by Propose for a
+// value longer than MaxValueBytes. Nothing was proposed.
+var ErrValueTooLarge = errors.New("replog: value is too large to replicate")

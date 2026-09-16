@@ -32,7 +32,7 @@ func NewCore(cfg replog.Config, store replog.Store, rng *rand.Rand) (*Core, erro
 	if err != nil {
 		return nil, err
 	}
-	return &Core{log: n, state: tournament.New()}, nil
+	return &Core{log: n, state: tournament.NewState()}, nil
 }
 
 // Applied is one slot the state machine consumed.
@@ -61,7 +61,9 @@ func (c *Core) Step(now time.Duration, env replog.Envelope) []replog.Envelope {
 func (c *Core) Tick(now time.Duration) []replog.Envelope { return c.log.Tick(now) }
 
 // Submit proposes cmd as the value of the next free slot. It returns
-// replog.ErrNotLeader when this replica does not lead, and an error for a
+// replog.NotLeaderError when this replica does not lead, replog.ErrBusy when
+// the leader's queue is full, an error wrapping replog.ErrValueTooLarge when
+// the encoded command exceeds replog.MaxValueBytes, and an error for a
 // command that does not encode or whose key is malformed.
 func (c *Core) Submit(now time.Duration, cmd tournament.Command) ([]replog.Envelope, error) {
 	if err := tournament.ValidateKey(cmd.Key); err != nil {
@@ -150,8 +152,8 @@ type Status struct {
 	CommitIndex paxos.Slot `json:"commit_index"`
 	// Applied is the state machine's applied slot.
 	Applied paxos.Slot `json:"applied"`
-	// StateHash identifies the applied prefix.
-	StateHash [32]byte `json:"state_hash"`
+	// StateHash identifies the applied prefix; JSON renders it as hex.
+	StateHash tournament.Digest `json:"state_hash"`
 	// Tournaments is the number of tournaments in the state.
 	Tournaments int `json:"tournaments"`
 }
@@ -167,7 +169,7 @@ func (c *Core) Status() Status {
 		Ready:       c.log.Ready(),
 		CommitIndex: c.log.CommitIndex(),
 		Applied:     c.state.Applied(),
-		StateHash:   c.state.Hash(),
-		Tournaments: len(c.state.Tournaments()),
+		StateHash:   tournament.Digest(c.state.Hash()),
+		Tournaments: c.state.TournamentCount(),
 	}
 }

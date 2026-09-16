@@ -2,9 +2,11 @@ package paxos
 
 import "errors"
 
-// ErrNotReady is returned by Proposer.Propose before a quorum of promises has
-// arrived for the current ballot, or after the attempt was abandoned.
-var ErrNotReady = errors.New("paxos: proposer has no quorum of promises for its ballot")
+// ErrNoQuorum is returned by Proposer.Propose before a quorum of promises has
+// arrived for the current ballot, or after the attempt was abandoned. It is
+// unrelated to replog.ErrNotReady, which a replicated-log leader returns for
+// reads before its leadership no-op is chosen.
+var ErrNoQuorum = errors.New("paxos: proposer has no quorum of promises for its ballot")
 
 // Proposer is the reference single-decree proposer. One Proposer runs one
 // attempt at a time: Start picks a ballot, OnPromise collects Phase 1
@@ -41,10 +43,13 @@ func (p *Proposer) Start(round uint64) Ballot {
 // Ballot returns the ballot of the current attempt.
 func (p *Proposer) Ballot() Ballot { return p.ballot }
 
-// OnPromise records a Phase 1 reply. Replies for other ballots are ignored.
-// It reports whether a quorum of promises has been collected.
+// OnPromise records a Phase 1 reply. Replies for other ballots are ignored,
+// and so is every reply that arrives after Propose fixed the attempt's value:
+// a late promise may report an earlier acceptance, and taking it into
+// account would change the value within one ballot. It reports whether a
+// quorum of promises has been collected.
 func (p *Proposer) OnPromise(from NodeID, m Promise) (ready bool) {
-	if p.abandoned || m.Ballot != p.ballot || p.promises == nil {
+	if p.abandoned || p.proposed || m.Ballot != p.ballot || p.promises == nil {
 		return p.ready()
 	}
 	p.promises[from] = m
@@ -64,11 +69,17 @@ func (p *Proposer) OnNack(m Nack) {
 }
 
 // Propose returns the ballot and the value to send in Accept: the value of
-// the highest-ballot promise, or want when no promise reports a value. It
-// returns ErrNotReady before a quorum of promises or after a Nack.
+// the highest-ballot promise, or want when no promise reports a value. The
+// first successful call fixes the value for the attempt; every later call
+// returns the same ballot and value whatever want is, so a retransmission
+// never sends a second value under one ballot (S4). It returns ErrNoQuorum
+// before a quorum of promises or after a Nack.
 func (p *Proposer) Propose(want Value) (Ballot, Value, error) {
 	if !p.ready() {
-		return Ballot{}, nil, ErrNotReady
+		return Ballot{}, nil, ErrNoQuorum
+	}
+	if p.proposed {
+		return p.ballot, p.value, nil
 	}
 	reports := make([]PValue, 0, len(p.promises))
 	for _, m := range p.promises {

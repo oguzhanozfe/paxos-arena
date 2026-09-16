@@ -7,7 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strings"
+
+	"github.com/oguzhanozfe/paxos-arena/internal/jsonx"
 )
 
 // Digest is a 32-byte digest rendered as 64 hex characters in JSON.
@@ -217,24 +218,9 @@ func Fingerprint(c Command) [32]byte {
 	return out
 }
 
-// strictUnmarshal decodes exactly one JSON value into v, rejecting unknown
-// fields and any non-whitespace after the value.
-func strictUnmarshal(b []byte, v any) error {
-	s := string(b)
-	dec := json.NewDecoder(strings.NewReader(s))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(v); err != nil {
-		return err
-	}
-	off := dec.InputOffset()
-	if off < 0 || int(off) > len(s) {
-		return errors.New("decoder offset out of range")
-	}
-	if strings.TrimSpace(s[off:]) != "" {
-		return errors.New("trailing data after JSON value")
-	}
-	return nil
-}
+// strictUnmarshal is jsonx.DecodeStrict: one JSON value, no unknown
+// fields, nothing but whitespace after it.
+func strictUnmarshal(b []byte, v any) error { return jsonx.DecodeStrict(b, v) }
 
 // Shape bounds.
 const (
@@ -242,6 +228,10 @@ const (
 	MaxIDLen         = 64
 	MaxEntryFee      = 1_000_000_000_000 // 10^12 minor units
 	MaxEntrantsBound = 1_000_000
+	// MaxPrizePlaces bounds len(Rules.PrizeBps).
+	MaxPrizePlaces = 1000
+	// MaxJurisdictions bounds the codes of one exclusion list.
+	MaxJurisdictions = 1000
 )
 
 // ValidateKey checks an idempotency key: 1 to MaxKeyLen bytes, each a
@@ -261,7 +251,38 @@ func ValidateKey(k IdempotencyKey) error {
 	return nil
 }
 
-func validID(s string) bool { return len(s) >= 1 && len(s) <= MaxIDLen }
+// validID reports whether s is a well-formed tournament or player
+// identifier: 1 to MaxIDLen bytes, each an ASCII letter, a digit, '.', '_'
+// or '-'. The restriction is what makes the ledger's account names and
+// posting keys unambiguous: they join identifiers with ':' ("fee:<tid>:<pid>"),
+// so an identifier containing ':' could make two tournaments share a key.
+// It also keeps identifiers valid UTF-8, so that two different identifiers
+// never encode to the same JSON and share a fingerprint.
+func validID(s string) bool {
+	if len(s) < 1 || len(s) > MaxIDLen {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case 'a' <= c && c <= 'z', 'A' <= c && c <= 'Z', '0' <= c && c <= '9', c == '.', c == '_', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// idRule describes validID for rejection details.
+const idRule = "1 to 64 characters from A-Z, a-z, 0-9, '.', '_' and '-'"
+
+// ValidateTournamentID checks the shape of a tournament identifier.
+func ValidateTournamentID(id TournamentID) error {
+	if !validID(string(id)) {
+		return fmt.Errorf("tournament id must be %s", idRule)
+	}
+	return nil
+}
 
 func validJurisdiction(j string) bool {
 	if len(j) < 2 || len(j) > 8 {
@@ -275,9 +296,12 @@ func validJurisdiction(j string) bool {
 	return true
 }
 
-// ValidateExclusions checks the shape of an exclusion list: every code is
-// 2 to 8 upper-case letters.
+// ValidateExclusions checks the shape of an exclusion list: at most
+// MaxJurisdictions codes, each 2 to 8 upper-case letters.
 func ValidateExclusions(e Exclusions) error {
+	if len(e.Jurisdictions) > MaxJurisdictions {
+		return fmt.Errorf("exclusion list has %d jurisdictions, limit %d", len(e.Jurisdictions), MaxJurisdictions)
+	}
 	for _, j := range e.Jurisdictions {
 		if !validJurisdiction(j) {
 			return fmt.Errorf("jurisdiction %q is not 2 to 8 upper-case letters", j)
@@ -289,7 +313,7 @@ func ValidateExclusions(e Exclusions) error {
 // ValidatePlayer checks the shape of a player claim.
 func ValidatePlayer(p Player) error {
 	if !validID(string(p.ID)) {
-		return fmt.Errorf("player id must be 1 to %d bytes", MaxIDLen)
+		return fmt.Errorf("player id must be %s", idRule)
 	}
 	if !validJurisdiction(p.Jurisdiction) {
 		return fmt.Errorf("jurisdiction %q is not 2 to 8 upper-case letters", p.Jurisdiction)
@@ -313,6 +337,9 @@ func ValidateRules(r Rules) error {
 	}
 	if len(r.PrizeBps) == 0 {
 		return errors.New("prize_bps must have at least one place")
+	}
+	if len(r.PrizeBps) > MaxPrizePlaces {
+		return fmt.Errorf("prize_bps has %d places, limit %d", len(r.PrizeBps), MaxPrizePlaces)
 	}
 	var sum uint64
 	for i, b := range r.PrizeBps {

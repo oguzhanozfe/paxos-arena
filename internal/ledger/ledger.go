@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 
 	"github.com/oguzhanozfe/paxos-arena/internal/paxos"
@@ -240,11 +241,18 @@ func (b *Book) CheckBalances() error {
 }
 
 // Check verifies the book's own consistency: every amount is positive,
-// every posting's Seq equals its position, keys are unique, and the sum of
-// all balances is zero. It returns the first problem found.
+// every posting's Seq equals its position, keys are unique and indexed at
+// their posting, every balance equals the one recomputed from the postings,
+// and the sum of all balances is zero. It returns the first problem found.
+//
+// Check proves that no money appeared or disappeared inside the book. It
+// cannot tell whether the postings are the right ones: a posting that was
+// never made (a command whose posting was skipped as a retry) leaves a
+// consistent book. The tournament state machine and the simulator's domain
+// invariants check that every entry and payout has its posting.
 func (b *Book) Check() error {
-	var sum Money
 	seen := make(map[PostingKey]bool, len(b.postings))
+	derived := make(map[Account]Money)
 	for i, p := range b.postings {
 		if p.Seq != uint64(i)+1 {
 			return fmt.Errorf("ledger: posting at position %d has seq %d", i+1, p.Seq)
@@ -256,14 +264,41 @@ func (b *Book) Check() error {
 			return fmt.Errorf("ledger: key %q posted twice", p.Key)
 		}
 		seen[p.Key] = true
+		if j, ok := b.byKey[p.Key]; !ok || j != i {
+			return fmt.Errorf("ledger: key %q is not indexed at position %d", p.Key, i+1)
+		}
+		derived[p.Debit] -= p.Amount
+		derived[p.Credit] += p.Amount
 	}
-	for _, v := range b.balances {
-		sum += v
+	if len(b.byKey) != len(b.postings) {
+		return fmt.Errorf("ledger: %d keys indexed for %d postings", len(b.byKey), len(b.postings))
 	}
-	if sum != 0 {
-		return fmt.Errorf("ledger: balances sum to %d, want 0", sum)
+	if err := b.CheckBalances(); err != nil {
+		return err
+	}
+	for _, a := range sortedAccounts(b.balances, derived) {
+		if b.balances[a] != derived[a] {
+			return fmt.Errorf("ledger: balance of %q is %d, postings give %d", a, b.balances[a], derived[a])
+		}
 	}
 	return nil
+}
+
+// sortedAccounts returns the accounts of both maps in order, so that Check
+// reports the same first problem on every run.
+func sortedAccounts(ms ...map[Account]Money) []Account {
+	seen := make(map[Account]bool)
+	var out []Account
+	for _, m := range ms {
+		for a := range m {
+			if !seen[a] {
+				seen[a] = true
+				out = append(out, a)
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 // Hash returns a sha256 over the JSON encoding of every posting in Seq

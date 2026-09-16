@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -139,5 +140,90 @@ func TestHTTPHandlerRejects(t *testing.T) {
 	}
 	if st := tr.Stats(); st.Rejected != 5 || st.Received != 1 {
 		t.Errorf("stats = %+v", st)
+	}
+}
+
+// TestMaxValueFitsInOneMessage: an Accept and a Learn carrying a value of
+// replog.MaxValueBytes encode within MaxMessageBytes, and the handler
+// delivers such an Accept. A command the log accepts must never be a
+// message the transport refuses: a refused Accept is retransmitted forever
+// and the slot is never chosen.
+func TestMaxValueFitsInOneMessage(t *testing.T) {
+	value := paxos.Value(strings.Repeat("\xff", replog.MaxValueBytes))
+	b := paxos.Ballot{Round: 1 << 62, Node: 1 << 31}
+	var accept []byte
+	for _, msg := range []replog.Message{
+		replog.Accept{Ballot: b, Slot: 1 << 62, Value: value},
+		replog.Learn{Slot: 1 << 62, Ballot: b, Value: value},
+	} {
+		enc, err := replog.Encode(replog.Envelope{From: 1 << 31, To: 2, Msg: msg})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(enc) > MaxMessageBytes {
+			t.Fatalf("%s with a %d-byte value encodes to %d bytes, above MaxMessageBytes %d",
+				replog.TypeName(msg), replog.MaxValueBytes, len(enc), MaxMessageBytes)
+		}
+		if accept == nil {
+			accept = enc
+		}
+	}
+	var got replog.Envelope
+	tr := NewHTTP(2, nil, func(e replog.Envelope) { got = e }, nil, nil)
+	rec := httptest.NewRecorder()
+	tr.Handler().ServeHTTP(rec, httptest.NewRequest("POST", Path, bytes.NewReader(accept)))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("handler answered %d for the largest Accept: %s", rec.Code, rec.Body.String())
+	}
+	if a, ok := got.Msg.(replog.Accept); !ok || len(a.Value) != replog.MaxValueBytes {
+		t.Fatalf("delivered %T with %d value bytes", got.Msg, len(a.Value))
+	}
+}
+
+// TestBulkRetransmissionsCoalesce: re-sending a large Accept while a copy is
+// still queued adds nothing to the queue, a small message is not held back
+// by it, and once the queued copy is taken for posting the next
+// retransmission is queued again.
+func TestBulkRetransmissionsCoalesce(t *testing.T) {
+	delivered := make(chan replog.Envelope, 64)
+	var recv *HTTP
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { recv.Handler().ServeHTTP(w, r) }))
+	defer srv.Close()
+	peers := map[paxos.NodeID]string{2: srv.URL}
+	recv = NewHTTP(2, peers, func(e replog.Envelope) { delivered <- e }, nil, nil)
+	send := NewHTTP(1, peers, func(replog.Envelope) {}, nil, nil)
+	big := replog.Envelope{From: 1, To: 2, Msg: replog.Accept{Ballot: paxos.Ballot{Round: 2, Node: 1}, Slot: 5, Value: make(paxos.Value, BulkBytes+1)}}
+	for i := 0; i < 10; i++ {
+		send.Send(big)
+	}
+	send.Send(replog.Envelope{From: 1, To: 2, Msg: replog.Heartbeat{Ballot: paxos.Ballot{Round: 2, Node: 1}}})
+	if st := send.Stats(); st.Sent != 11 || st.Coalesced != 9 || st.Dropped != 0 {
+		t.Fatalf("stats before Run = %+v, want 9 of 10 bulk copies coalesced", st)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); send.Run(ctx) }()
+	got := map[string]int{}
+	for len(got) < 2 {
+		select {
+		case e := <-delivered:
+			got[replog.TypeName(e.Msg)]++
+		case <-time.After(5 * time.Second):
+			t.Fatalf("delivered so far: %v", got)
+		}
+	}
+	send.Send(big)
+	select {
+	case e := <-delivered:
+		if _, ok := e.Msg.(replog.Accept); !ok {
+			t.Fatalf("delivered %T after the retransmission", e.Msg)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a retransmission after the queued copy was posted was not delivered")
+	}
+	cancel()
+	<-done
+	if got["accept"] != 1 || got["heartbeat"] != 1 {
+		t.Fatalf("delivered %v, want one accept and one heartbeat before the retransmission", got)
 	}
 }

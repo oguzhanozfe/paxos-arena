@@ -92,7 +92,18 @@ const (
 	DefaultLeaseDuration      = 150 * time.Millisecond
 	DefaultWindow             = 64
 	DefaultLearnBatch         = 256
+	DefaultQueueLimit         = 1024
 )
+
+// MaxValueBytes bounds the length of a value Propose accepts. Every value
+// travels whole in one Accept and one Learn, so a transport must carry a
+// message holding a value of this length in its own encoding; see
+// transport.MaxMessageBytes. It is far above the HTTP API's default body
+// limit of 64 KiB, so that a command decoded from any accepted body and
+// re-encoded canonically (where JSON may escape a character as six bytes)
+// still fits; the API checks the encoded length against it before
+// proposing.
+const MaxValueBytes = 1 << 20
 
 // Config configures one Node.
 type Config struct {
@@ -122,6 +133,11 @@ type Config struct {
 	// LearnBatch bounds the number of entries in one reply to LearnRequest.
 	// Default 256.
 	LearnBatch int
+	// QueueLimit bounds the number of values a leader holds back while
+	// Window slots are in flight. Propose returns ErrBusy beyond it, so a
+	// leader that cannot get slots chosen does not accumulate proposals
+	// without bound. Default 1024.
+	QueueLimit int
 	// Unsafe is nil in production. See UnsafeKnobs.
 	Unsafe *UnsafeKnobs
 }
@@ -138,6 +154,7 @@ func DefaultConfig(self paxos.NodeID, peers []paxos.NodeID) Config {
 		LeaseDuration:      DefaultLeaseDuration,
 		Window:             DefaultWindow,
 		LearnBatch:         DefaultLearnBatch,
+		QueueLimit:         DefaultQueueLimit,
 	}
 }
 
@@ -158,6 +175,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.LearnBatch == 0 {
 		c.LearnBatch = DefaultLearnBatch
+	}
+	if c.QueueLimit == 0 {
+		c.QueueLimit = DefaultQueueLimit
 	}
 	return c
 }
@@ -209,6 +229,9 @@ func (c Config) Validate() error {
 	}
 	if c.LearnBatch < 1 {
 		return errors.New("replog: LearnBatch must be at least 1")
+	}
+	if c.QueueLimit < 1 {
+		return errors.New("replog: QueueLimit must be at least 1")
 	}
 	return nil
 }

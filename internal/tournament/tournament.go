@@ -17,10 +17,11 @@ import (
 	"github.com/oguzhanozfe/paxos-arena/internal/paxos"
 )
 
-// TournamentID identifies a tournament: 1 to 64 bytes.
+// TournamentID identifies a tournament: 1 to 64 characters from A-Z, a-z,
+// 0-9, '.', '_' and '-'. The state machine rejects any other identifier.
 type TournamentID string
 
-// PlayerID identifies a player: 1 to 64 bytes.
+// PlayerID identifies a player, with the same shape as TournamentID.
 type PlayerID string
 
 // IdempotencyKey identifies one client command: 1 to 128 bytes of printable
@@ -79,7 +80,11 @@ const (
 	// is distinct.
 	EarliestSubmission TieBreak = "earliest_submission"
 	// Split gives equal scores the same place and splits their combined
-	// prize money.
+	// prize money. Only the prize places are pooled: a tie group that
+	// crosses the last prize place is cut off there, so the tied entrants
+	// ranked inside the paid places (earliest submitters first) share the
+	// shares of those places and the tied entrants below them receive
+	// nothing. See ComputePayouts.
 	Split TieBreak = "split"
 )
 
@@ -105,7 +110,7 @@ func (e Exclusions) Contains(j string) bool {
 // Player is the eligibility claim a client makes for an entrant. Nothing
 // here is verified beyond its shape.
 type Player struct {
-	// ID is 1 to 64 bytes.
+	// ID has the shape of a TournamentID.
 	ID PlayerID `json:"id"`
 	// Jurisdiction is 2 to 8 upper-case letters.
 	Jurisdiction string `json:"jurisdiction"`
@@ -257,6 +262,11 @@ const (
 	NotClosed Code = "not_closed"
 	// InvalidExclusions means the Settle list is malformed.
 	InvalidExclusions Code = "invalid_exclusions"
+	// LedgerConflict means a posting the command must make has a key that
+	// already exists in the ledger; nothing happened. Identifier validation
+	// makes it unreachable, and the state machine checks it anyway rather
+	// than let the ledger treat the posting as an idempotent retry.
+	LedgerConflict Code = "ledger_conflict"
 )
 
 // Result is what applying a command produced. It is recorded under the

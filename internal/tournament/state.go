@@ -38,8 +38,8 @@ func (s *State) Mutations() uint64 { return s.mutations }
 // Recorded returns the number of keys in the results table.
 func (s *State) Recorded() int { return len(s.results) }
 
-// New returns an empty state at applied slot 0.
-func New() *State {
+// NewState returns an empty state at applied slot 0.
+func NewState() *State {
 	return &State{
 		tournaments: make(map[TournamentID]*Tournament),
 		results:     make(map[IdempotencyKey]record),
@@ -74,6 +74,10 @@ func (s *State) Tournament(id TournamentID) (Tournament, bool) {
 func (s *State) Tournaments() []TournamentID {
 	return append([]TournamentID(nil), s.order...)
 }
+
+// TournamentCount returns the number of tournaments without copying the
+// identifiers.
+func (s *State) TournamentCount() int { return len(s.order) }
 
 // Ledger returns the book for read-only use by callers.
 func (s *State) Ledger() *ledger.Book { return s.book }
@@ -175,8 +179,8 @@ func (s *State) execute(slot paxos.Slot, ballot paxos.Ballot, cmd Command) Resul
 func reject(code Code, detail string) Result { return Result{Code: code, Detail: detail} }
 
 func (s *State) create(slot paxos.Slot, op CreateTournament) Result {
-	if !validID(string(op.ID)) {
-		return reject(InvalidRules, fmt.Sprintf("tournament id must be 1 to %d bytes", MaxIDLen))
+	if err := ValidateTournamentID(op.ID); err != nil {
+		return reject(InvalidRules, err.Error())
 	}
 	if err := ValidateRules(op.Rules); err != nil {
 		return reject(InvalidRules, err.Error())
@@ -215,15 +219,24 @@ func (s *State) join(slot paxos.Slot, ballot paxos.Ballot, op Join) Result {
 		return reject(Underage, fmt.Sprintf("age %d is below the minimum %d", op.Player.Age, t.Rules.MinAge))
 	}
 	tid, pid := string(t.ID), string(op.Player.ID)
-	_, _, err := s.book.Post(ledger.Posting{
+	fee := ledger.Posting{
 		Key: ledger.FeeKey(tid, pid), Kind: ledger.EntryFee,
 		Debit: ledger.PlayerAccount(pid), Credit: ledger.PoolAccount(tid),
 		Amount: t.Rules.EntryFee, Tournament: tid, Player: pid,
 		ExclusionVersion: t.Rules.Exclusions.Version, Slot: slot, Ballot: ballot,
-	})
+	}
+	if err := s.checkFresh([]ledger.Posting{fee}); err != nil {
+		return reject(LedgerConflict, err.Error())
+	}
+	_, posted, err := s.book.Post(fee)
 	if err != nil {
 		// Unreachable with validated rules; kept so Apply stays total.
 		return reject(InvalidRules, "entry fee posting rejected: "+err.Error())
+	}
+	if !posted {
+		// Unreachable after checkFresh; a no-op here would record an entry
+		// whose fee was never charged.
+		return reject(LedgerConflict, fmt.Sprintf("posting key %q already exists", fee.Key))
 	}
 	t.Entries = append(t.Entries, Entry{
 		Player: op.Player, JoinSeq: uint32(len(t.Entries) + 1),
@@ -335,9 +348,15 @@ func (s *State) settle(slot paxos.Slot, ballot paxos.Ballot, op Settle) Result {
 			return reject(InvalidRules, "payout posting rejected: "+err.Error())
 		}
 	}
+	if err := s.checkFresh(postings); err != nil {
+		return reject(LedgerConflict, err.Error())
+	}
 	for _, p := range postings {
-		if _, _, err := s.book.Post(p); err != nil {
-			return reject(InvalidRules, "payout posting rejected: "+err.Error())
+		if _, posted, err := s.book.Post(p); err != nil || !posted {
+			// Unreachable after Validate and checkFresh, which guarantee
+			// every Post appends. Stop rather than record a payout that
+			// moved no money.
+			panic(fmt.Sprintf("tournament: settle %q: posting %q not appended (err %v)", tid, p.Key, err))
 		}
 	}
 	t.Payouts = payouts
@@ -345,6 +364,23 @@ func (s *State) settle(slot paxos.Slot, ballot paxos.Ballot, op Settle) Result {
 	t.SettledAt = slot
 	t.Ballot = ballot
 	return Result{Code: OK}
+}
+
+// checkFresh reports an error when a posting a command is about to make has
+// a key that is already in the book or repeated within ps. The ledger treats
+// a repeated key as an idempotent retry and books nothing, so a command that
+// posted onto an existing key would record money movements that never
+// happened. Identifier validation makes this unreachable; the check keeps
+// the invariant local instead of relying on it.
+func (s *State) checkFresh(ps []ledger.Posting) error {
+	seen := make(map[ledger.PostingKey]bool, len(ps))
+	for _, p := range ps {
+		if s.book.Has(p.Key) || seen[p.Key] {
+			return fmt.Errorf("posting key %q already exists", p.Key)
+		}
+		seen[p.Key] = true
+	}
+	return nil
 }
 
 // mix extends the hash chain with everything the applied slot changed.

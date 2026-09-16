@@ -71,7 +71,7 @@ func TestSingleNodeCoreAppliesInOrder(t *testing.T) {
 	if st.Self != 1 || st.Leader != 1 || st.Role != replog.Leader || !st.Ready || st.CommitIndex != 3 || st.Applied != 3 || st.Tournaments != 1 {
 		t.Errorf("Status = %+v", st)
 	}
-	if st.StateHash != c.State().Hash() {
+	if st.StateHash != tournament.Digest(c.State().Hash()) {
 		t.Error("Status hash differs from the state hash")
 	}
 }
@@ -152,9 +152,9 @@ func TestSubmitErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = c.Submit(0, createCmd("k", "t"))
-	var nl replog.ErrNotLeader
+	var nl replog.NotLeaderError
 	if !errors.As(err, &nl) {
-		t.Errorf("Submit on a follower = %v, want ErrNotLeader", err)
+		t.Errorf("Submit on a follower = %v, want NotLeaderError", err)
 	}
 	if _, err := c.Submit(0, tournament.Command{Key: "", Op: tournament.Close{Tournament: "t"}}); err == nil {
 		t.Error("Submit accepted an empty key")

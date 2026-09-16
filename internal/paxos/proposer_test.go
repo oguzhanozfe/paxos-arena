@@ -45,8 +45,8 @@ func TestProposerNeedsQuorumBeforePropose(t *testing.T) {
 			if tc.wantReady && err != nil {
 				t.Errorf("Propose error = %v, want nil", err)
 			}
-			if !tc.wantReady && !errors.Is(err, ErrNotReady) {
-				t.Errorf("Propose error = %v, want ErrNotReady", err)
+			if !tc.wantReady && !errors.Is(err, ErrNoQuorum) {
+				t.Errorf("Propose error = %v, want ErrNoQuorum", err)
 			}
 		})
 	}
@@ -94,8 +94,8 @@ func TestProposerNackAbandonsAttempt(t *testing.T) {
 		t.Fatal("a Nack for another ballot must not abandon the attempt")
 	}
 	p.OnNack(Nack{Ballot: b, Promised: Ballot{Round: 5, Node: 2}})
-	if _, _, err := p.Propose(Value("v")); !errors.Is(err, ErrNotReady) {
-		t.Fatalf("Propose after Nack: err = %v, want ErrNotReady", err)
+	if _, _, err := p.Propose(Value("v")); !errors.Is(err, ErrNoQuorum) {
+		t.Fatalf("Propose after Nack: err = %v, want ErrNoQuorum", err)
 	}
 	if p.OnPromise(3, Promise{Ballot: b}) {
 		t.Error("promises after abandonment must not make the proposer ready")
@@ -153,5 +153,28 @@ func TestProposerAcceptedBeforeProposeIgnored(t *testing.T) {
 	b := p.Start(1)
 	if p.OnAccepted(1, b) || p.OnAccepted(2, b) {
 		t.Fatal("Accepted before Propose must not count")
+	}
+}
+
+// TestProposeFixesTheValueOfTheBallot: once Propose has picked a value,
+// later calls return the same ballot and value, and a late promise that
+// reports another acceptance is not taken into account.
+func TestProposeFixesTheValueOfTheBallot(t *testing.T) {
+	p := NewProposer(1, 3)
+	b := p.Start(5)
+	p.OnPromise(1, Promise{Ballot: b})
+	p.OnPromise(2, Promise{Ballot: b})
+	b1, v1, err := p.Propose(Value("mine"))
+	if err != nil || b1 != b || string(v1) != "mine" {
+		t.Fatalf("first Propose = %v %q %v", b1, v1, err)
+	}
+	p.OnPromise(3, Promise{Ballot: b, Accepted: Ballot{Round: 4, Node: 2}, Value: Value("theirs")})
+	b2, v2, err := p.Propose(Value("other"))
+	if err != nil || b2 != b1 || string(v2) != "mine" || string(p.Value()) != "mine" {
+		t.Fatalf("second Propose = %v %q %v (Value %q), want %v %q", b2, v2, err, p.Value(), b1, "mine")
+	}
+	p.Start(6)
+	if _, _, err := p.Propose(Value("x")); !errors.Is(err, ErrNoQuorum) {
+		t.Fatalf("Propose after Start = %v, want ErrNoQuorum", err)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -38,10 +39,26 @@ func randomSeeds() int {
 	return *randomSeedsFlag
 }
 
-// replay is the command line that reproduces a run.
-func replay(p Params) string {
-	return fmt.Sprintf("go run ./cmd/chaos -seed %d -nodes %d -steps %d -drop %g -dup %g -scenario %q",
-		p.Seed, p.Nodes, p.Steps, p.Faults.DropP, p.Faults.DupP, p.Scenario)
+// replay returns a command that reproduces a run of p, the parameters as
+// the test built them (before a scenario adjusts them). When p is what
+// cmd/chaos builds from its flags (DefaultParams with -nodes, -steps,
+// -liveness-steps, -drop, -dup and -scenario applied) it is the chaos
+// command line, in the format cmd/chaos prints. Otherwise the CLI cannot
+// express p, and it is the go test command that runs the failing test
+// alone.
+func replay(t testing.TB, p Params) string {
+	q := DefaultParams(p.Seed)
+	q.Nodes, q.Steps, q.LivenessSteps = p.Nodes, p.Steps, p.LivenessSteps
+	q.Faults.DropP, q.Faults.DupP, q.Scenario = p.Faults.DropP, p.Faults.DupP, p.Scenario
+	if reflect.DeepEqual(p, q) {
+		return fmt.Sprintf("go run ./cmd/chaos -seed %d -nodes %d -steps %d -liveness-steps %d -drop %g -dup %g -scenario %q",
+			p.Seed, p.Nodes, p.Steps, p.LivenessSteps, p.Faults.DropP, p.Faults.DupP, p.Scenario)
+	}
+	parts := strings.Split(t.Name(), "/")
+	for i, part := range parts {
+		parts[i] = "^" + regexp.QuoteMeta(part) + "$"
+	}
+	return fmt.Sprintf("go test ./internal/sim -count=1 -run '%s'", strings.Join(parts, "/"))
 }
 
 // runFull runs the fault phase, heals and runs the liveness phase, failing
@@ -54,29 +71,29 @@ func runFull(t *testing.T, p Params) Report {
 		t.Fatalf("New: %v", err)
 	}
 	if err := r.RunFaults(); err != nil {
-		t.Fatalf("fault phase: %v\nreplay: %s", err, replay(r.Params()))
+		t.Fatalf("fault phase: %v\nreplay: %s", err, replay(t, p))
 	}
 	r.Heal()
 	if err := r.RunLiveness(); err != nil {
-		t.Fatalf("liveness phase: %v\nreplay: %s", err, replay(r.Params()))
+		t.Fatalf("liveness phase: %v\nreplay: %s", err, replay(t, p))
 	}
 	rep := r.Report()
 	ep := r.Params()
 	if rep.Participants != rep.Nodes {
-		t.Fatalf("%d of %d nodes participated in the final round\nreplay: %s", rep.Participants, rep.Nodes, replay(ep))
+		t.Fatalf("%d of %d nodes participated in the final round\nreplay: %s", rep.Participants, rep.Nodes, replay(t, p))
 	}
 	if rep.Completed != rep.Issued {
-		t.Fatalf("completed %d of %d issued client commands\nreplay: %s", rep.Completed, rep.Issued, replay(ep))
+		t.Fatalf("completed %d of %d issued client commands\nreplay: %s", rep.Completed, rep.Issued, replay(t, p))
 	}
 	if rep.Unexpected != 0 {
-		t.Fatalf("%d unexpected results for workflow steps\nreplay: %s", rep.Unexpected, replay(ep))
+		t.Fatalf("%d unexpected results for workflow steps\nreplay: %s", rep.Unexpected, replay(t, p))
 	}
 	if ep.Clients > 0 {
 		if want := ep.Clients * ep.tournamentsPerBatch(); rep.Settled < want {
-			t.Fatalf("settled %d tournaments, want at least %d\nreplay: %s", rep.Settled, want, replay(ep))
+			t.Fatalf("settled %d tournaments, want at least %d\nreplay: %s", rep.Settled, want, replay(t, p))
 		}
 		if rep.Marks["client.settled"] != rep.Settled {
-			t.Fatalf("clients saw %d settlements, checker saw %d settled tournaments\nreplay: %s", rep.Marks["client.settled"], rep.Settled, replay(ep))
+			t.Fatalf("clients saw %d settlements, checker saw %d settled tournaments\nreplay: %s", rep.Marks["client.settled"], rep.Settled, replay(t, p))
 		}
 	}
 	for _, inv := range Invariants {
@@ -89,7 +106,7 @@ func runFull(t *testing.T, p Params) Report {
 			continue // read barriers are checked when a read completes
 		}
 		if rep.Checks[inv.ID] == 0 {
-			t.Errorf("invariant %s was never evaluated\nreplay: %s", inv.ID, replay(ep))
+			t.Errorf("invariant %s was never evaluated\nreplay: %s", inv.ID, replay(t, p))
 		}
 	}
 	return rep
@@ -229,12 +246,12 @@ func TestLivenessWithFrozenMinority(t *testing.T) {
 				t.Fatal(err)
 			}
 			if err := r.RunFaults(); err != nil {
-				t.Fatalf("fault phase: %v\nreplay: %s", err, replay(r.Params()))
+				t.Fatalf("fault phase: %v\nreplay: %s", err, replay(t, p))
 			}
 			core := []paxos.NodeID{paxos.NodeID(1 + seed%5), paxos.NodeID(1 + (seed+1)%5), paxos.NodeID(1 + (seed+2)%5)}
 			r.HealCore(core)
 			if err := r.RunLiveness(); err != nil {
-				t.Fatalf("liveness phase with core %v: %v\nreplay: %s", core, err, replay(r.Params()))
+				t.Fatalf("liveness phase with core %v: %v\nreplay: %s", core, err, replay(t, p))
 			}
 			rep := r.Report()
 			if rep.Participants != len(core) {
@@ -340,11 +357,11 @@ func TestReplayDeterministic(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := r.RunFaults(); err != nil {
-			t.Fatalf("%v\nreplay: %s", err, replay(p))
+			t.Fatalf("%v\nreplay: %s", err, replay(t, p))
 		}
 		r.Heal()
 		if err := r.RunLiveness(); err != nil {
-			t.Fatalf("%v\nreplay: %s", err, replay(p))
+			t.Fatalf("%v\nreplay: %s", err, replay(t, p))
 		}
 		return buf.Bytes(), r.Report()
 	}
@@ -497,7 +514,7 @@ func FuzzSeed(f *testing.F) {
 		}
 		var v *Violation
 		if errors.As(err, &v) {
-			t.Fatalf("%v\nreplay: %s", err, replay(p))
+			t.Fatalf("%v\nreplay: %s", err, replay(t, p))
 		}
 	})
 }

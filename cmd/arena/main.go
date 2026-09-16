@@ -2,9 +2,15 @@
 //
 // Without -peers it starts N replicas in one process, connected by an
 // in-memory bus, each with its own HTTP port, and prints curl commands that
-// exercise them. With -id and -peers it runs one replica per process over
-// the HTTP transport, so that a replica can be killed and restarted
-// independently of the others.
+// exercise them. Their state is in memory and ends with the process.
+//
+// With -id, -peers and -wal it runs one replica per process over the HTTP
+// transport, keeping the replica's promise, accepted values and chosen
+// entries in the append-only file named by -wal. A replica killed and
+// restarted with the same -wal file rejoins with that state. -wal is
+// required in this mode: a replica that restarts without its durable state
+// forgets promises and acknowledged commands, and must not rejoin under its
+// old identity.
 package main
 
 import (
@@ -30,6 +36,7 @@ import (
 	"github.com/oguzhanozfe/paxos-arena/internal/paxos"
 	"github.com/oguzhanozfe/paxos-arena/internal/replica"
 	"github.com/oguzhanozfe/paxos-arena/internal/replog"
+	"github.com/oguzhanozfe/paxos-arena/internal/replog/wal"
 	"github.com/oguzhanozfe/paxos-arena/internal/transport"
 )
 
@@ -56,6 +63,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	listen := fs.String("listen", "127.0.0.1:8081", "listen address; with -nodes, node i listens on port+i-1 (port 0 picks free ports)")
 	id := fs.Uint("id", 0, "this replica's node id, for one replica per process (requires -peers)")
 	peers := fs.String("peers", "", "every replica as id=base-url, comma separated, for one replica per process")
+	walPath := fs.String("wal", "", "append-only file holding this replica's durable log state (required with -peers)")
 	logLevel := fs.String("log-level", "info", "log level: debug, info, warn, error")
 	logJSON := fs.Bool("log-json", false, "log JSON records instead of text")
 	if err := fs.Parse(args); err != nil {
@@ -72,10 +80,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 	logger := slog.New(handler)
 	if *peers != "" {
-		return runSingle(ctx, paxos.NodeID(*id), *peers, *listen, logger, stdout)
+		return runSingle(ctx, paxos.NodeID(*id), *peers, *listen, *walPath, logger, stdout)
 	}
 	if *id != 0 {
 		return errors.New("-id requires -peers")
+	}
+	if *walPath != "" {
+		return errors.New("-wal requires -id and -peers: replicas started together with -nodes keep their state in memory")
 	}
 	return runCluster(ctx, *nodes, *listen, logger, stdout)
 }
@@ -232,8 +243,9 @@ func parsePeers(spec string) (map[paxos.NodeID]string, []paxos.NodeID, error) {
 	return out, ids, nil
 }
 
-// runSingle runs one replica over the HTTP transport.
-func runSingle(ctx context.Context, self paxos.NodeID, peersSpec, listen string, logger *slog.Logger, stdout io.Writer) error {
+// runSingle runs one replica over the HTTP transport with its durable
+// state in the file at walPath.
+func runSingle(ctx context.Context, self paxos.NodeID, peersSpec, listen, walPath string, logger *slog.Logger, stdout io.Writer) error {
 	urls, ids, err := parsePeers(peersSpec)
 	if err != nil {
 		return err
@@ -244,11 +256,23 @@ func runSingle(ctx context.Context, self paxos.NodeID, peersSpec, listen string,
 	if _, ok := urls[self]; !ok {
 		return fmt.Errorf("-id %d is not in -peers", self)
 	}
+	if walPath == "" {
+		return errors.New("-wal is required with -peers: a replica that restarts without its durable state " +
+			"would rejoin under its old id having forgotten its promises and acknowledged commands")
+	}
+	store, err := wal.Open(walPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if err := store.Bind(self, ids); err != nil {
+		return err
+	}
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", listen, err)
 	}
-	core, err := replica.NewCore(replog.DefaultConfig(self, ids), replog.NewMemStore(), seededRNG(self))
+	core, err := replica.NewCore(replog.DefaultConfig(self, ids), store, seededRNG(self))
 	if err != nil {
 		ln.Close()
 		return err
@@ -279,7 +303,8 @@ func runSingle(ctx context.Context, self paxos.NodeID, peersSpec, listen string,
 			errc <- err
 		}
 	}()
-	fmt.Fprintf(stdout, "arena: node %d of %v listening on http://%s\n", self, ids, ln.Addr())
+	fmt.Fprintf(stdout, "arena: node %d of %v listening on http://%s, durable state in %s (commit index %d)\n",
+		self, ids, ln.Addr(), walPath, core.Log().CommitIndex())
 	for _, id := range ids {
 		fmt.Fprintf(stdout, "  node %d  %s\n", id, urls[id])
 	}
@@ -303,10 +328,12 @@ func printClusterInstructions(w io.Writer, ids []paxos.NodeID, urls map[paxos.No
 	}
 	fmt.Fprintln(w)
 	printCurl(w, urls[ids[0]], urls, ids)
-	fmt.Fprintln(w, "To run replicas as separate processes (so one can be killed and restarted), start each with")
-	fmt.Fprintln(w, "  arena -id <n> -listen <host:port> -peers 1=http://127.0.0.1:8081,2=http://127.0.0.1:8082,3=http://127.0.0.1:8083")
+	fmt.Fprintln(w, "To run replicas as separate processes, so that one can be killed and restarted, start each with its own log file:")
+	fmt.Fprintln(w, "  arena -id <n> -listen <host:port> -wal node<n>.wal -peers 1=http://127.0.0.1:8081,2=http://127.0.0.1:8082,3=http://127.0.0.1:8083")
+	fmt.Fprintln(w, "A replica restarted with the same -wal file keeps its promises, accepted values and chosen entries.")
+	fmt.Fprintln(w, "One whose file is lost must not rejoin under its old id: start a new cluster instead.")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Ctrl-C stops every replica. State is in memory and is lost on exit.")
+	fmt.Fprintln(w, "Ctrl-C stops every replica. In this mode state is in memory and is lost on exit.")
 }
 
 // printCurl prints the curl commands of one full tournament.

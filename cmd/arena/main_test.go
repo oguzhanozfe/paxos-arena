@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +20,7 @@ import (
 	"github.com/oguzhanozfe/paxos-arena/internal/paxos"
 	"github.com/oguzhanozfe/paxos-arena/internal/replica"
 	"github.com/oguzhanozfe/paxos-arena/internal/replog"
+	"github.com/oguzhanozfe/paxos-arena/internal/replog/wal"
 	"github.com/oguzhanozfe/paxos-arena/internal/tournament"
 	"github.com/oguzhanozfe/paxos-arena/internal/transport"
 )
@@ -358,25 +360,44 @@ func TestRunClusterPrintsInstructions(t *testing.T) {
 }
 
 func TestRunRejectsBadArguments(t *testing.T) {
-	cases := [][]string{
-		{"-bogus"},
-		{"-nodes", "0", "-listen", "127.0.0.1:0"},
-		{"-listen", "nohostport"},
-		{"-id", "1"},
-		{"-id", "0", "-peers", "1=http://127.0.0.1:1"},
-		{"-id", "2", "-peers", "1=http://127.0.0.1:1"},
-		{"-id", "1", "-peers", "1=127.0.0.1:1"},
-		{"-id", "1", "-peers", "x=http://127.0.0.1:1"},
-		{"-id", "1", "-peers", "1=http://a,1=http://b"},
-		{"-log-level", "loud"},
+	dir := t.TempDir()
+	log := filepath.Join(dir, "node.wal")
+	other := filepath.Join(dir, "other.wal")
+	f, err := wal.Open(other)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, args := range cases {
+	if err := f.Bind(2, []paxos.NodeID{1, 2}); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	cases := []struct {
+		args []string
+		want string
+	}{
+		{[]string{"-bogus"}, "flag provided but not defined"},
+		{[]string{"-nodes", "0", "-listen", "127.0.0.1:0"}, "-nodes"},
+		{[]string{"-listen", "nohostport"}, "-listen"},
+		{[]string{"-id", "1"}, "-id requires -peers"},
+		{[]string{"-id", "0", "-wal", log, "-peers", "1=http://127.0.0.1:1"}, "-id is required"},
+		{[]string{"-id", "2", "-wal", log, "-peers", "1=http://127.0.0.1:1"}, "not in -peers"},
+		{[]string{"-id", "1", "-wal", log, "-peers", "1=127.0.0.1:1"}, "base URL"},
+		{[]string{"-id", "1", "-wal", log, "-peers", "x=http://127.0.0.1:1"}, "bad node id"},
+		{[]string{"-id", "1", "-wal", log, "-peers", "1=http://a,1=http://b"}, "listed twice"},
+		{[]string{"-log-level", "loud"}, "-log-level"},
+		// One replica per process needs its durable state.
+		{[]string{"-id", "1", "-listen", "127.0.0.1:0", "-peers", "1=http://127.0.0.1:1"}, "-wal is required"},
+		{[]string{"-nodes", "1", "-listen", "127.0.0.1:0", "-wal", log}, "-wal requires -id and -peers"},
+		// A log file written by another replica is refused.
+		{[]string{"-id", "1", "-listen", "127.0.0.1:0", "-wal", other, "-peers", "1=http://127.0.0.1:1,2=http://127.0.0.1:2"}, "belongs to node 2"},
+	}
+	for _, tc := range cases {
 		var stdout, stderr bytes.Buffer
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		err := run(ctx, args, &stdout, &stderr)
+		err := run(ctx, tc.args, &stdout, &stderr)
 		cancel()
-		if err == nil {
-			t.Errorf("run(%v) returned no error", args)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("run(%v) = %v, want an error containing %q", tc.args, err, tc.want)
 		}
 	}
 }

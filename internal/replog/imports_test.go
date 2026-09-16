@@ -20,12 +20,14 @@ var allowedDirectImports = map[string]bool{
 	"strings":                      true,
 	"time":                         true,
 	"math/rand/v2":                 true,
+	modulePath + "/internal/jsonx": true,
 	modulePath + "/internal/paxos": true,
 }
 
 // TestNoForbiddenImports enforces the dependency direction of the design:
-// the protocol core imports only a short list of standard packages and
-// internal/paxos, and depends on no other package of this module.
+// the protocol core imports only a short list of standard packages,
+// internal/paxos and internal/jsonx, and depends on no other package of this
+// module.
 func TestNoForbiddenImports(t *testing.T) {
 	goBin, err := exec.LookPath("go")
 	if err != nil {
@@ -59,7 +61,9 @@ func TestNoForbiddenImports(t *testing.T) {
 				if !strings.HasPrefix(dep, modulePath+"/") {
 					continue
 				}
-				if dep != modulePath+"/internal/paxos" && dep != modulePath+"/internal/replog" {
+				switch dep {
+				case modulePath + "/internal/jsonx", modulePath + "/internal/paxos", modulePath + "/internal/replog":
+				default:
 					t.Errorf("%s depends on %s, which is above it in the dependency direction", pkg, dep)
 				}
 			}

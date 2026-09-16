@@ -296,8 +296,8 @@ func TestReadIndexRefusedBeforeLeadershipNoOp(t *testing.T) {
 	}
 	var now time.Duration
 	tickUntilCandidate(t, n, &now)
-	if _, _, err := n.ReadIndex(now); !errors.As(err, &ErrNotLeader{}) {
-		t.Fatalf("ReadIndex as candidate: err = %v, want ErrNotLeader", err)
+	if _, _, err := n.ReadIndex(now); !errors.As(err, &NotLeaderError{}) {
+		t.Fatalf("ReadIndex as candidate: err = %v, want NotLeaderError", err)
 	}
 	// One remote promise plus the inline self promise is a quorum of 2.
 	outs := n.Step(now, Envelope{From: 2, To: 1, Msg: Promise{Ballot: n.Ballot()}})
@@ -410,9 +410,9 @@ func TestReadIndexNeedsMajorityAtOwnBallot(t *testing.T) {
 	if failed == nil || failed.Seq != seq2 {
 		t.Fatalf("no ReadFailed for seq %d in %+v", seq2, evs)
 	}
-	var nl ErrNotLeader
+	var nl NotLeaderError
 	if !errors.As(failed.Err, &nl) || nl.Leader != peers[1] {
-		t.Errorf("ReadFailed.Err = %v, want ErrNotLeader{%d}", failed.Err, peers[1])
+		t.Errorf("ReadFailed.Err = %v, want NotLeaderError{%d}", failed.Err, peers[1])
 	}
 	if changed == nil || changed.Self || changed.Leader != peers[1] || changed.Ballot != higher {
 		t.Errorf("LeaderChanged = %+v, want {Leader %d, Ballot %v, Self false}", changed, peers[1], higher)
@@ -534,9 +534,9 @@ func TestStepDownOnHigherPromiseNack(t *testing.T) {
 		t.Errorf("pending after step-down = %d in flight, %d queued; want 0, 0", inFlight, queued)
 	}
 	_, err = l.Propose(c.now, paxos.Value("y"))
-	var nl ErrNotLeader
+	var nl NotLeaderError
 	if !errors.As(err, &nl) || nl.Leader != peer {
-		t.Errorf("Propose after step-down: err = %v, want ErrNotLeader{%d}", err, peer)
+		t.Errorf("Propose after step-down: err = %v, want NotLeaderError{%d}", err, peer)
 	}
 	found := false
 	for _, ev := range l.Events() {
@@ -621,9 +621,9 @@ func TestProposeOnFollowerReportsLeader(t *testing.T) {
 			continue
 		}
 		_, err := c.nodes[id].Propose(c.now, paxos.Value("x"))
-		var nl ErrNotLeader
+		var nl NotLeaderError
 		if !errors.As(err, &nl) {
-			t.Fatalf("node %d: Propose err = %v, want ErrNotLeader", id, err)
+			t.Fatalf("node %d: Propose err = %v, want NotLeaderError", id, err)
 		}
 		if nl.Leader != l.Self() {
 			t.Errorf("node %d: leader hint %d, want %d", id, nl.Leader, l.Self())
@@ -669,6 +669,50 @@ func TestWindowQueuesExcessProposals(t *testing.T) {
 		if !found {
 			t.Errorf("%q never chosen", want)
 		}
+	}
+}
+
+// TestQueueLimitRefusesExcessProposals: once Window slots are in flight and
+// QueueLimit values are queued, Propose refuses with ErrBusy instead of
+// holding every value a stalled leader is given.
+func TestQueueLimitRefusesExcessProposals(t *testing.T) {
+	c := newCluster(t, 3, func(cfg *Config) { cfg.Window, cfg.QueueLimit = 2, 3 })
+	l := c.electLeader()
+	c.drop = func(e Envelope) bool { _, ok := e.Msg.(Accepted); return ok }
+	for i := 0; i < 5; i++ {
+		c.propose(l, paxos.Value(fmt.Sprintf("v%d", i)))
+	}
+	if _, err := l.Propose(c.now, paxos.Value("v5")); !errors.Is(err, ErrBusy) {
+		t.Fatalf("Propose with a full queue = %v, want ErrBusy", err)
+	}
+	if inFlight, queued := l.Pending(); inFlight != 2 || queued != 3 {
+		t.Fatalf("pending = %d in flight, %d queued; want 2, 3", inFlight, queued)
+	}
+	c.drop = nil
+	if !c.runUntil(2*time.Second, func() bool { in, q := l.Pending(); return in == 0 && q == 0 }) {
+		t.Fatal("queued proposals never drained")
+	}
+	if _, err := l.Propose(c.now, paxos.Value("v5")); err != nil {
+		t.Fatalf("Propose after the queue drained: %v", err)
+	}
+}
+
+// TestProposeRefusesOversizedValue: a value longer than MaxValueBytes is
+// refused before it takes a slot, because no transport would carry its
+// Accept.
+func TestProposeRefusesOversizedValue(t *testing.T) {
+	c := newCluster(t, 3, nil)
+	l := c.electLeader()
+	commit := l.CommitIndex()
+	if _, err := l.Propose(c.now, make(paxos.Value, MaxValueBytes+1)); !errors.Is(err, ErrValueTooLarge) {
+		t.Fatalf("Propose of %d bytes = %v, want ErrValueTooLarge", MaxValueBytes+1, err)
+	}
+	if in, q := l.Pending(); in != 0 || q != 0 {
+		t.Fatalf("the refused value is pending: %d in flight, %d queued", in, q)
+	}
+	c.propose(l, make(paxos.Value, MaxValueBytes))
+	if !c.runUntil(2*time.Second, func() bool { return l.CommitIndex() == commit+1 }) {
+		t.Fatalf("a value of exactly MaxValueBytes was not chosen (commit %d)", l.CommitIndex())
 	}
 }
 

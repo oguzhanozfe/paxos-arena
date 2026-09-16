@@ -62,7 +62,7 @@ type extraRetry struct {
 }
 
 // client runs tournament workflows one command at a time against the node
-// it believes is the leader, follows ErrNotLeader hints, learns results from
+// it believes is the leader, follows NotLeaderError hints, learns results from
 // the state machine of the node it talks to, and retries with the same key
 // when a result does not appear.
 type client struct {
@@ -403,7 +403,7 @@ func (r *Run) submit(c *client, nd *simNode, key tournament.IdempotencyKey, op t
 	c.submits++
 	r.report.Submits++
 	if err != nil {
-		var nl replog.ErrNotLeader
+		var nl replog.NotLeaderError
 		if errors.As(err, &nl) {
 			c.target = nl.Leader
 		} else {

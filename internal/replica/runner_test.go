@@ -3,6 +3,7 @@ package replica
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand/v2"
 	"sync"
 	"testing"
@@ -173,7 +174,7 @@ func TestSubmitFailsWithLeadershipLost(t *testing.T) {
 		}
 		// A consistent read now fails as not-leader; a stale read works.
 		err = r1.Read(context.Background(), true, func(*tournament.State) error { return nil })
-		var nl replog.ErrNotLeader
+		var nl replog.NotLeaderError
 		if !errors.As(err, &nl) {
 			t.Errorf("consistent read on a deposed leader = %v", err)
 		}
@@ -215,9 +216,9 @@ func TestReadConsistentSeesCompletedSubmit(t *testing.T) {
 			t.Errorf("Read did not return fn's error: %v", err)
 		}
 		err = r2.Read(context.Background(), true, func(*tournament.State) error { return nil })
-		var nl replog.ErrNotLeader
+		var nl replog.NotLeaderError
 		if !errors.As(err, &nl) || nl.Leader != 1 {
-			t.Errorf("consistent read on the follower = %v, want ErrNotLeader{1}", err)
+			t.Errorf("consistent read on the follower = %v, want NotLeaderError{1}", err)
 		}
 		waitFor(t, func() bool {
 			var ok bool
@@ -233,7 +234,7 @@ func TestReadConsistentSeesCompletedSubmit(t *testing.T) {
 		}
 		_, err = r2.Submit(context.Background(), createCmd("k2", "t2"))
 		if !errors.As(err, &nl) || nl.Leader != 1 {
-			t.Errorf("follower submit of a new key = %v, want ErrNotLeader{1}", err)
+			t.Errorf("follower submit of a new key = %v, want NotLeaderError{1}", err)
 		}
 		mutated := cmd
 		mutated.Op = tournament.Close{Tournament: "t1"}
@@ -306,4 +307,50 @@ func TestDeliverDropsWhenInboxIsFull(t *testing.T) {
 	if got := r.Dropped(); got != 10 {
 		t.Errorf("Dropped = %d, want 10", got)
 	}
+}
+
+// TestAbandonedSubmitsAreForgotten: while no slot can be chosen, a Submit
+// whose context ends is forgotten by the runner at its next tick, and once
+// the leader's queue is full a further Submit fails at once with
+// replog.ErrBusy instead of being held.
+func TestAbandonedSubmitsAreForgotten(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		peers := []paxos.NodeID{1, 2}
+		c := newCluster(t)
+		defer c.stop()
+		cfg := replog.DefaultConfig(1, peers)
+		cfg.Window, cfg.QueueLimit = 2, 3
+		r1 := c.add(cfg, replog.NewMemStore())
+		c.add(passive(2, peers), replog.NewMemStore())
+		waitFor(t, ready(r1), "node 1 to be ready")
+		c.bus.SetFilter(func(e replog.Envelope) bool {
+			_, isAccept := e.Msg.(replog.Accept)
+			return isAccept
+		})
+		for i := 0; i < 5; i++ {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+			_, err := r1.Submit(ctx, createCmd(fmt.Sprintf("k%d", i), fmt.Sprintf("t%d", i)))
+			cancel()
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Submit %d = %v, want a timeout", i, err)
+			}
+		}
+		_, err := r1.Submit(context.Background(), createCmd("k5", "t5"))
+		if !errors.Is(err, replog.ErrBusy) {
+			t.Fatalf("Submit with a full queue = %v, want replog.ErrBusy", err)
+		}
+		waitFor(t, func() bool { return r1.Held() == 0 }, "the abandoned submits to be forgotten")
+		if st := r1.Status(); st.Role != replog.Leader {
+			t.Fatalf("node 1 is %s; the test needs a leader that cannot choose", st.Role)
+		}
+		// The proposals are still in flight: when Accepts flow again they
+		// are chosen, and a retry under the same key gets the recorded
+		// result.
+		c.bus.SetFilter(nil)
+		waitFor(t, func() bool { return r1.Status().Applied >= 6 }, "the queued proposals to be applied")
+		res, err := r1.Submit(context.Background(), createCmd("k4", "t4"))
+		if err != nil || res.Code != tournament.OK || !res.Replayed {
+			t.Fatalf("retry of an abandoned submit = %+v, %v; want the replayed ok", res, err)
+		}
+	})
 }
