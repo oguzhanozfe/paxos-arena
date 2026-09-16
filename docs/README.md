@@ -33,6 +33,9 @@ the design. Each has context, decision and consequences.
 | [0008](adr/0008-arena-runs-in-one-process-by-default.md) | `cmd/arena` starts N replicas in one process by default; one replica per process remains available. |
 | [0009](adr/0009-protocol-details-that-differ-from-the-pseudocode.md) | Acceptor, leader, lease and clock details that differ from the design's pseudocode. |
 | [0010](adr/0010-api-status-codes.md) | HTTP status codes and forwarding rules that the design did not fix. |
+| [0011](adr/0011-file-store-for-per-process-replicas.md) | Per-process replicas keep their log state in an append-only file, required by `arena -peers`. |
+| [0012](adr/0012-bounds-on-commands.md) | Identifier shape, list and value size bounds, a bounded proposal queue, and forgetting abandoned requests. |
+| [0013](adr/0013-api-and-naming-corrections.md) | Smaller API, concurrency and naming corrections after review. |
 
 ## `research/`
 
@@ -52,8 +55,8 @@ sources; the design cites them. Nothing in them is normative.
   settlement that pays each prize once, leaderboards across replicas, audit
   trails, regulatory constraints as data; which of these are consistency
   problems; and the draft problem statement that `DESIGN.md` section 1
-  supersedes. Publishers are described by role in the prose; the URLs
-  identify them.
+  supersedes. Publishers are described by role; URLs are given for
+  regulators, encyclopedias, papers and open projects only.
 - [`research/go-practice.md`](research/go-practice.md): the Go release line
   and the `go` directive, repository layout, concurrency rules, a
   deterministic in-memory transport, table-driven and property-style tests,

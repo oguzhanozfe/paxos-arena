@@ -1,6 +1,7 @@
 # Design: a replicated settlement log for paid card-game tournaments
 
-Status: design, written 2026-09-16. This document is the specification the
+Status: implemented (milestones 1 to 3), written 2026-09-16 and corrected
+after review on 2026-09-17. This document is the specification the
 implementation follows. Where the implementation deviates from a paragraph
 below, the deviation is recorded in `docs/adr/` and the ADR takes precedence;
 `docs/README.md` lists them. It supersedes the draft problem statement in
@@ -257,7 +258,11 @@ The lease is not used to serve reads. See 3.5.
    key.
 6. The handler that submitted the command is waiting on that key. When the
    local state machine applies a command with that key, from whichever slot,
-   the handler returns the result. If leadership is lost first, the wait ends
+   the handler returns the result if the applied command has the same
+   fingerprint as its own; if it has a different one (two pending
+   submissions under one key with different payloads), the handler's
+   command is answered as its own application will be, `key_reused`. A wait
+   whose context ends is forgotten at the runner's next tick. If leadership is lost first, the wait ends
    with `ErrLeadershipLost` and the handler forwards or answers 503. If the wait
    exceeds the request deadline, the handler answers 504 with code
    `outcome_unknown`; the client retries with the same key and receives the
@@ -285,7 +290,7 @@ read-index barrier:
    reporting the leader's own ballot as their promised ballot, arrive from a
    majority (counting itself), the barrier is satisfied. Any ack reporting a
    higher promised ballot makes the leader step down and the read fails with
-   `ErrNotLeader`.
+   `NotLeaderError`.
 4. The handler waits until the local applied index reaches readIndex and
    answers from local state.
 
@@ -306,11 +311,13 @@ how far behind it is. They are for dashboards, never for settlement.
 
 Each replica persists, before answering, its promised ballot, the highest
 round it has used as a proposer, every accepted (ballot, slot, value), and
-every chosen (slot, value). The default store is in memory; the simulator
-keeps the store object across a simulated crash so a restart recovers exactly
-what a disk would have. An optional append-only file WAL provides the same
-interface for the demo. A node that has lost its store must not rejoin under
-its old identity (section 9).
+every chosen (slot, value). The simulator uses the in-memory store and keeps
+the store object across a simulated crash so a restart recovers exactly what
+a disk would have. The append-only file store `replog/wal` provides the same
+interface for replicas that run in their own process, and `cmd/arena`
+requires it in that mode. A node that has lost its store must not rejoin
+under its old identity (section 9); the file records the node and membership
+it belongs to, so a file cannot be started as another replica.
 
 The state machine is not persisted. On restart a replica replays chosen
 entries from slot 1. Replay is deterministic, so a replayed node's state hash
@@ -327,8 +334,9 @@ simulator drives all of them from one goroutine.
 `internal/replica.Runner` is the one goroutine per process that owns a `Core`.
 Transport receive goroutines and HTTP handler goroutines hand it work through
 channels and wait on reply channels or `ctx.Done()`. The HTTP transport uses
-one sending goroutine per peer. Every goroutine is bound to a context and the
-tests use `testing/synctest` where timers are involved.
+two sending goroutines per peer, one for ordinary messages and one for large
+ones. Every goroutine is bound to a context; the `Runner` tests use
+`testing/synctest`.
 
 ---
 
@@ -340,14 +348,15 @@ paxos-arena/
   README.md
   LICENSE
   Makefile                      check: gofmt, vet, build, tidy -diff, test -race
-  .github/workflows/ci.yml
+  .github/workflows/go.yml
   cmd/
     arena/main.go               one replica: HTTP API + Paxos participant
     chaos/main.go               deterministic simulation CLI
   internal/
+    jsonx/                      strict JSON decoding shared by every codec and the API
     paxos/                      single-decree Paxos: ballots, rules, reference acceptor/proposer
     replog/                     Multi-Paxos log with leader, lease, read index; wire codec; MemStore
-    replog/wal/                 optional append-only file store implementing replog.Store
+    replog/wal/                 append-only file store implementing replog.Store
     transport/                  in-memory fault-injecting network; HTTP transport
     tournament/                 deterministic tournament state machine and command codec
     ledger/                     append-only double-entry book with idempotent postings
@@ -362,20 +371,25 @@ paxos-arena/
     seeds.txt                   seeds that once failed; rerun by every go test
 ```
 
-Dependency direction, enforced by review and by `TestNoForbiddenImports` in
-`internal/replog` and `internal/tournament` (which inspect `go list -deps`):
+Dependency direction. `TestNoForbiddenImports` in `internal/replog` (for
+`paxos` and `replog`) and in `internal/tournament` (for `ledger` and
+`tournament`) inspects `go list -deps`; the edges above the core are kept by
+review:
 
 ```
-paxos <- ledger <- tournament <- replica <- api
-paxos <- replog  <- replica    <- sim
-replog <- transport
-replog <- replog/wal
+paxos  <- ledger     <- tournament <- replica <- api <- cmd/arena
+paxos  <- replog     <- replica    <- sim <- cmd/chaos
+replog <- transport  <- sim, cmd/arena
+replog <- replog/wal <- cmd/arena
+replog, ledger, tournament <- api        ledger, tournament <- sim
+jsonx  <- replog, replog/wal, tournament, api
 ```
 
 `internal/paxos`, `internal/replog`, `internal/tournament`, `internal/ledger`
 import only `encoding/json`, `crypto/sha256`, `errors`, `fmt`, `sort`,
 `strconv`, `strings`, `time` (for `time.Duration` only), `math/rand/v2` (for
-the injected `*rand.Rand` type only) and each other. `internal/replog/wal` is
+the injected `*rand.Rand` type only), `encoding/hex` (in `tournament`, for
+the input digest rendered as hex), `internal/jsonx` and each other. `internal/replog/wal` is
 the one store that touches the file system and is kept out of `replog` so the
 rule stays mechanical.
 
@@ -434,7 +448,7 @@ func NewProposer(self NodeID, n int) *Proposer
 func (p *Proposer) Start(round uint64) Ballot                  // ballot for a new attempt
 func (p *Proposer) OnPromise(from NodeID, m Promise) (ready bool)
 func (p *Proposer) OnNack(m Nack)                              // abandons the attempt
-func (p *Proposer) Propose(want Value) (Ballot, Value, error)  // ErrNotReady before quorum
+func (p *Proposer) Propose(want Value) (Ballot, Value, error)  // ErrNoQuorum before quorum; the first value is kept for the ballot
 func (p *Proposer) OnAccepted(from NodeID, b Ballot) (chosen bool)
 ```
 
@@ -455,6 +469,7 @@ type Config struct {
     LeaseDuration      time.Duration    // default 150ms; must be <= ElectionTimeoutMin
     Window             int              // default 64 slots in flight
     LearnBatch         int              // default 256 entries per LearnRequest reply
+    QueueLimit         int              // default 1024 values queued beyond Window; then ErrBusy
     Unsafe             *UnsafeKnobs     // nil in production; see section 6.4
 }
 func (c Config) Validate() error
@@ -487,7 +502,7 @@ func New(cfg Config, store Store, rng *rand.Rand) (*Node, error)   // loads dura
 // Self are processed inline and never returned.
 func (n *Node) Step(now time.Duration, env Envelope) []Envelope
 func (n *Node) Tick(now time.Duration) []Envelope
-func (n *Node) Propose(now time.Duration, v paxos.Value) ([]Envelope, error) // ErrNotLeader{Leader}
+func (n *Node) Propose(now time.Duration, v paxos.Value) ([]Envelope, error) // NotLeaderError{Leader}
 func (n *Node) ReadIndex(now time.Duration) (seq uint64, out []Envelope, err error)
 func (n *Node) Events() []Event          // drains events since the last call
 
@@ -501,8 +516,11 @@ func (n *Node) Chosen(s paxos.Slot) (Entry, bool)
 func (n *Node) CommitIndex() paxos.Slot
 func (n *Node) Ready() bool                              // Leader and leadership no-op chosen
 
-type ErrNotLeader struct{ Leader paxos.NodeID } // Leader may be 0 (unknown)
+type NotLeaderError struct{ Leader paxos.NodeID } // Leader may be 0 (unknown)
 var ErrNotReady = errors.New("replog: leader has not committed its leadership no-op")
+var ErrBusy = errors.New("replog: the leader's proposal queue is full")
+var ErrValueTooLarge = errors.New("replog: value is too large to replicate") // wrapped
+const MaxValueBytes = 1 << 20   // Propose refuses longer values; every transport carries one
 
 // Durable state.
 type Durable struct {
@@ -526,15 +544,22 @@ func Encode(env Envelope) ([]byte, error)
 func Decode(b []byte) (Envelope, error)
 ```
 
-`internal/replog/wal` (optional, milestone 3) implements `replog.Store` on an
-append-only file: one length-prefixed JSON record per `Save*` call, `fsync`
-after each write, and `Load` that replays records and truncates a torn tail.
+`internal/replog/wal` implements `replog.Store` on an append-only file: one
+record per `Save*` call (length and CRC-32C header, JSON payload), `fsync`
+after each write. `Open` truncates a torn tail (an incomplete last record, or
+a last record whose checksum fails) and refuses a file damaged before its
+last record. `Bind` records the replica and membership in an empty file and
+refuses a file that belongs to another.
 
 ```go
 package wal
 
-type File struct{ /* *os.File, path */ }
-func Open(path string) (*File, error)   // creates when missing
+type File struct{ /* *os.File, path, valid length, membership */ }
+func Open(path string) (*File, error)   // creates when missing; cuts a torn tail
+var ErrCorrupt error                     // damage before the last record
+type Membership struct{ Self paxos.NodeID; Peers []paxos.NodeID }
+func (f *File) Bind(self paxos.NodeID, peers []paxos.NodeID) error
+func (f *File) Membership() (Membership, bool)
 func (f *File) Load() (replog.Durable, error)
 func (f *File) SavePromised(paxos.Ballot) error
 func (f *File) SaveMaxRound(uint64) error
@@ -574,8 +599,14 @@ func (n *Network) Stats() Stats
 // HTTP is the inter-process transport for the demo: POST /internal/paxos with
 // the replog wire encoding. Best effort: Send never blocks; a full per-peer
 // queue drops the message, and the protocol's retransmission covers the loss.
-type HTTP struct { /* peers map[NodeID]string, per-peer chan, client, deliver */ }
-func NewHTTP(self paxos.NodeID, peers map[paxos.NodeID]string, deliver Deliver, client *http.Client) *HTTP
+// Messages are encoded by the sender goroutines. Messages carrying more than
+// BulkBytes (64 KiB) of values use a second per-peer queue, and a
+// retransmission of one still queued is dropped, so heartbeats never wait
+// behind them. MaxMessageBytes (16 MiB) admits an Accept or Learn carrying a
+// value of replog.MaxValueBytes.
+type HTTP struct { /* peers map[NodeID]*peer (queue, bulk queue, pending), client, deliver, log */ }
+func NewHTTP(self paxos.NodeID, peers map[paxos.NodeID]string, deliver Deliver, client *http.Client, log *slog.Logger) *HTTP
+func NewClient(timeout time.Duration, perHost int) *http.Client // a connection pool of its own
 func (t *HTTP) Send(env replog.Envelope)
 func (t *HTTP) Handler() http.Handler      // mount at POST /internal/paxos
 func (t *HTTP) Run(ctx context.Context)    // starts and stops the sender goroutines
@@ -617,7 +648,7 @@ func (b *Book) Has(k PostingKey) bool
 func (b *Book) Balance(a Account) Money
 func (b *Book) Postings() []Posting                    // copy, in Seq order
 func (b *Book) ForTournament(id string) []Posting
-func (b *Book) Check() error                           // sum of all balances == 0; amounts > 0
+func (b *Book) Check() error                           // amounts > 0, keys unique, balances == recomputed, sum == 0
 func (b *Book) Hash() [32]byte                         // sha256 over postings in Seq order
 
 func PlayerAccount(id string) Account
@@ -662,7 +693,7 @@ type Result struct {
 type Code string           // "ok", "key_reused", "unknown_tournament", ... (section 5.4)
 
 type State struct { /* tournaments, order, results, book, applied */ }
-func New() *State
+func NewState() *State
 // Apply is total: it never panics on a decoded Command and never leaves the
 // state half-changed. It returns the recorded result for a repeated key.
 func (s *State) Apply(slot paxos.Slot, ballot paxos.Ballot, cmd Command) Result
@@ -670,6 +701,7 @@ func (s *State) Applied() paxos.Slot
 func (s *State) Hash() [32]byte                          // canonical encoding of everything
 func (s *State) Tournament(id TournamentID) (Tournament, bool)   // deep copy
 func (s *State) Tournaments() []TournamentID             // creation order
+func (s *State) TournamentCount() int                    // without copying
 func (s *State) Ledger() *ledger.Book                    // read-only use by callers
 func (s *State) Result(k IdempotencyKey) (Result, bool)
 
@@ -703,26 +735,29 @@ func (c *Core) ReadIndex(now time.Duration) (uint64, []replog.Envelope, error)
 // ApplyCommitted decodes and applies every chosen slot above Applied() up to
 // the commit index, in order, and returns what it applied.
 func (c *Core) ApplyCommitted() []Applied
-type Applied struct{ Slot paxos.Slot; Key tournament.IdempotencyKey; Result tournament.Result; NoOp bool }
+type Applied struct{ Slot paxos.Slot; Key tournament.IdempotencyKey; Command tournament.Command; Result tournament.Result; NoOp bool; Err error }
 func (c *Core) Events() []replog.Event
 func (c *Core) Log() *replog.Node
 func (c *Core) State() *tournament.State
 
 // Runner is the single event-loop goroutine around a Core.
-type Runner struct { /* core, inbox, submits, reads, ticker, waiters map[Key][]chan Result */ }
+type Runner struct { /* core, inbox, submits, reads, ticker, waiters map[Key][]*waiter (command, fingerprint, reply) */ }
 func NewRunner(core *Core, send func(replog.Envelope), log *slog.Logger) *Runner
 func (r *Runner) Run(ctx context.Context) error       // returns when ctx is done
 func (r *Runner) Deliver(env replog.Envelope)          // transport callback; non-blocking enqueue
 func (r *Runner) Submit(ctx context.Context, cmd tournament.Command) (tournament.Result, error)
 func (r *Runner) Read(ctx context.Context, consistent bool, fn func(*tournament.State) error) error
 func (r *Runner) Status() Status
+func (r *Runner) Held() int                            // requests waiting on the event loop
 type Status struct {
     Self, Leader paxos.NodeID
     Role         replog.Role
     Ballot       paxos.Ballot
+    Ready        bool
     CommitIndex  paxos.Slot
     Applied      paxos.Slot
-    StateHash    [32]byte
+    StateHash    tournament.Digest   // hex in JSON
+    Tournaments  int
 }
 
 // ErrLeadershipLost ends a pending Submit when this replica stops leading
@@ -730,12 +765,18 @@ type Status struct {
 var ErrLeadershipLost = errors.New("replica: leadership lost while the command was pending")
 ```
 
-`Submit` returns `replog.ErrNotLeader` immediately when this replica is not
-the leader, and `ErrLeadershipLost` when the key was pending and leadership
-changed before it was applied. `Read` with `consistent=true` runs the
-read-index barrier of section 3.5 and then executes `fn` on the event-loop
-goroutine; with `consistent=false` it executes `fn` immediately on that
-goroutine.
+`Submit` returns `replog.NotLeaderError` immediately when this replica is not
+the leader, `replog.ErrBusy` when the leader's queue is full, and
+`ErrLeadershipLost` when the key was pending and leadership changed before
+it was applied. A pending `Submit` is answered with the result of the applied
+command only when the fingerprints match; otherwise with `key_reused`.
+`Read` with `consistent=true` runs the read-index barrier of section 3.5 and
+then executes `fn` on the event-loop goroutine; with `consistent=false` it
+executes `fn` immediately on that goroutine. When the context ends first,
+`Read` returns at once while `fn` may still run, so a caller uses what `fn`
+wrote only when `Read` returned nil. The runner refreshes `Status` before it
+answers any request an event completed, so a caller woken by
+`ErrLeadershipLost` already sees the new role.
 
 ### 4.7 `internal/api`
 
@@ -752,11 +793,12 @@ type Config struct {
     Self           paxos.NodeID
     Peers          map[paxos.NodeID]string   // node -> base URL, for forwarding
     RequestTimeout time.Duration             // default 5s; bounds the wait for apply
-    MaxBody        int64                     // default 1<<20
+    MaxBody        int64                     // default DefaultMaxBody, 64 KiB
     Seed           func() uint64             // default crypto/rand; injectable in tests
     Now            func() time.Time          // default time.Now; injectable in tests
+    Client         *http.Client              // forwarding; default has its own pool of ForwardConnsPerHost (256)
 }
-type Server struct { /* cfg, backend, inflight map[string]fingerprint under one mutex, client, log */ }
+type Server struct { /* cfg, backend, inflight set of keys under one mutex, log */ }
 func New(cfg Config, b Backend, log *slog.Logger) *Server
 func (s *Server) Handler() http.Handler
 ```
@@ -776,20 +818,24 @@ Routes (Go 1.22 method patterns), all under `http.NewServeMux()`:
 | `GET /healthz` | | 200 |
 
 Every POST requires `Idempotency-Key`. Handler flow: 400 if the header is
-missing or the body is malformed (unknown fields, trailing data, over
-MaxBody); compute the fingerprint of the decoded payload; under the mutex,
-an in-flight entry with the same key answers 409 `in_flight`; otherwise mark
-in flight, call `Submit`, and clear the mark when it returns. The state
+missing or the body is malformed (unknown fields, trailing data); 413
+`body_too_large` if the body exceeds MaxBody or the canonical encoding of
+the command exceeds `replog.MaxValueBytes`; under the mutex, an in-flight
+entry with the same key answers 409 `in_flight`; otherwise mark in flight,
+call `Submit`, and clear the mark when it returns. A successful response
+carries the tournament record from a stale read under a context of its own,
+taken after the command was applied; lists render as `[]`, never `null`. The state
 machine, not the in-flight map, is the authority on repeated keys: a replayed
 `Result` with `Code == "ok"` returns the original success status with
 `"replayed": true`; a replayed rejection returns its original status;
 `key_reused` (same key, different fingerprint) answers 422.
 
 State-machine rejections answer 409 with `application/problem+json`
-(RFC 9457) whose `code` member is the `tournament.Code`. `ErrNotLeader` or
-`ErrLeadershipLost` with a known leader forwards once; otherwise 503 with
-`Retry-After: 1`. A wait that
-exceeds `RequestTimeout` answers 504 with `code: "outcome_unknown"`.
+(RFC 9457) whose `code` member is the `tournament.Code`. `NotLeaderError` or
+`ErrLeadershipLost` with a known leader forwards once, and the leader's
+answer is relayed whole; otherwise 503 with `Retry-After: 1`. `ErrBusy`
+answers 503 with `Retry-After: 1`. A wait that exceeds `RequestTimeout`
+answers 504 with `code: "outcome_unknown"`.
 
 Request bodies (JSON):
 
@@ -852,18 +898,21 @@ func Scenarios() []string
 ```
 
 `cmd/chaos` flags: `-seed`, `-seeds N` (sweep seed..seed+N-1), `-nodes`,
-`-steps`, `-drop`, `-dup`, `-scenario`, `-trace` (write the event trace to a
-file). On a violation it prints `seed=<n> step=<k> scenario=<s>` and the exact
+`-steps`, `-liveness-steps`, `-drop`, `-dup`, `-scenario`, `-trace` (write
+the event trace to a file), `-log-level`, `-no-summary`, `-list-scenarios`. On a violation it prints `seed=<n> step=<k> scenario=<s>` and the exact
 command line to replay, and exits 1.
 
 ### 4.9 `cmd/arena`
 
 Flags: `-id 1`, `-peers 1=http://127.0.0.1:8081,2=http://127.0.0.1:8082,3=http://127.0.0.1:8083`,
-`-listen :8081`, `-wal path` (optional), `-log-level info`, `-log-json`.
+`-listen :8081`, `-wal path` (required with `-peers`), `-log-level info`,
+`-log-json`; without `-peers`, `-nodes N` starts N replicas in one process
+(ADR 0008) and `-wal` is refused.
 `main` parses flags and calls `run(ctx, args, stdout, stderr) error`, which
-builds `replog.Config` from the peer list, opens the store, constructs
-`replica.Core`, `replica.Runner`, `transport.HTTP` and `api.Server`, mounts
-the API and `/internal/paxos` on one `http.Server` with timeouts set, and
+builds `replog.Config` from the peer list, opens the store with `wal.Open`
+and binds it to the replica with `Bind`, constructs `replica.Core`,
+`replica.Runner`, `transport.HTTP` and `api.Server`, mounts the API and
+`/internal/paxos` on one `http.Server` with timeouts set, and
 stops on SIGINT/SIGTERM through `signal.NotifyContext` and `Shutdown`.
 
 ---
@@ -1032,7 +1081,7 @@ on Nack(m) for ballot, Candidate or Leader:
         maxRound = max(maxRound, m.Promised.Round); store.SaveMaxRound
         step down: role = Follower; proposals, reads, queue cleared; emit LeaderChanged{m.Promised.Node, m.Promised, false}
         electionDeadline = now + m.LeaseRemaining + randomElectionTimeout()
-        pending reads fail with ErrNotLeader; the host fails pending submits with ErrLeadershipLost
+        pending reads fail with NotLeaderError; the host fails pending submits with ErrLeadershipLost
 
 Propose(now, v), Leader:
     if len(proposals) >= Window: queue = append(queue, v); return
@@ -1076,17 +1125,17 @@ Types shared by the commands:
 ```go
 type Exclusions struct {
     Version       uint64   `json:"version"`
-    Jurisdictions []string `json:"jurisdictions"` // upper-case codes; sorted and deduplicated by Encode
+    Jurisdictions []string `json:"jurisdictions"` // at most 1000 upper-case codes; sorted and deduplicated by Encode
 }
 type Player struct {
-    ID           PlayerID `json:"id"`           // 1..64 bytes
+    ID           PlayerID `json:"id"`           // 1..64 characters from A-Z a-z 0-9 . _ -
     Jurisdiction string   `json:"jurisdiction"` // 2..8 bytes, upper-case letters
     Age          int      `json:"age"`          // 0..150
 }
 type Rules struct {
     EntryFee    ledger.Money `json:"entry_fee"`    // > 0
     RakeBps     uint32       `json:"rake_bps"`     // 0..9999
-    PrizeBps    []uint32     `json:"prize_bps"`    // len >= 1; each > 0; sum == 10000
+    PrizeBps    []uint32     `json:"prize_bps"`    // 1..1000 places; each > 0; sum == 10000
     MinEntrants int          `json:"min_entrants"` // >= len(PrizeBps); minimum scored entrants at Close
     MaxEntrants int          `json:"max_entrants"` // >= MinEntrants
     MaxScore    int64        `json:"max_score"`    // >= 0
@@ -1100,13 +1149,22 @@ Commands, with the validation performed by `Apply`. Validation order is the
 order listed; the first failing rule is the result code. A rejected command
 has no effect other than recording its result under its key.
 
+Identifiers (tournament and player) are restricted to 1..64 characters from
+`A-Z`, `a-z`, `0-9`, `.`, `_` and `-`. Ledger account names and posting keys
+join identifiers with `:` (section 5.5), so an identifier containing `:`
+could give two tournaments one posting key, and the ledger would treat the
+second posting as a retry. The restriction also keeps identifiers valid
+UTF-8, so two identifiers never share a JSON encoding and a fingerprint. As
+a second line of defence, a command whose postings would reuse an existing
+key is rejected with `ledger_conflict` before anything changes.
+
 ```go
 type CreateTournament struct {
     ID    TournamentID `json:"id"`    // 1..64 bytes
     Seed  uint64       `json:"seed"`  // server-generated by the leader's API; excluded from Fingerprint
     Rules Rules        `json:"rules"`
 }
-// invalid_rules     any Rules bound above violated, or ID empty
+// invalid_rules     any Rules bound above violated, or ID not of the identifier shape
 // tournament_exists ID already exists
 // Effect: Tournament{ID, Seed, Rules, Status: Open}; no postings.
 
@@ -1114,12 +1172,14 @@ type Join struct {
     Tournament TournamentID `json:"tournament"`
     Player     Player       `json:"player"`
 }
+// invalid_player           Player.ID not of the identifier shape, Jurisdiction or Age malformed
 // unknown_tournament
 // not_open                 Status != Open
 // tournament_full          len(Entries) == MaxEntrants
 // already_joined           Player.ID present
 // jurisdiction_excluded    Player.Jurisdiction in Rules.Exclusions.Jurisdictions
 // underage                 Player.Age < Rules.MinAge
+// ledger_conflict          the FeeKey posting exists already (unreachable with valid identifiers)
 // Effect: Entry{Player, JoinSeq: len(Entries)+1, ExclusionVersion: Rules.Exclusions.Version};
 //         posting EntryFee: Debit player:<pid>, Credit pool:<tid>, Amount EntryFee, Key FeeKey.
 //         Result.Seed = Tournament.Seed.
@@ -1152,9 +1212,11 @@ type Settle struct {
     Tournament TournamentID `json:"tournament"`
     Exclusions Exclusions   `json:"exclusions"`   // the list current at settlement
 }
+// invalid_exclusions       more than 1000 codes, or a code that is not 2..8 upper-case letters
 // unknown_tournament
 // not_closed               Status is Open or Settled (a second Settle with a new key is rejected;
 //                          a second Settle with the same key is replayed)
+// ledger_conflict          a rake, prize, withheld or refund posting key exists already
 // Effect, Status == Closed: Payouts = ComputePayouts(t, Exclusions); postings in this order:
 //         Rake (pool -> rake:<tid>, if rake > 0), then per payout in Place order:
 //         Prize (pool -> player) or Withheld (pool -> withheld:<tid>);
@@ -1312,7 +1374,7 @@ tournament at the moment its Settle was applied.
 | S2 | Identical applied sequences: every node's applied prefix equals the chosen sequence up to its applied slot, and `State.Hash()` is equal for equal applied slots on every node, including a node rebuilt by replay. | `Checker.AfterEvent`: after each `ApplyCommitted`, compare `Hash()` against the first hash recorded for that slot. `Checker.AtEnd`: replay the chosen log into a fresh `tournament.State` and compare. | `sim.*`; `tournament.TestReplayDeterministic`; `replica.TestReplayFromStore`. |
 | S3 | Acceptor monotonicity: `Promised()` never decreases; an acceptor accepts only ballots `>= Promised()`; after promising b it never accepts below b. | `Checker.AfterEvent` on every `Step` that carried Prepare or Accept: compare `Promised()` with the previous value; check `Accepted(s).Ballot >= Promised()` was true at accept time (the checker observes the pre-step promise). | `paxos.TestAcceptorRules` (table over all orderings of two ballots); `replog.TestAcceptorMonotonic`. |
 | S4 | Ballot uniqueness: no two nodes ever use the same ballot; at most one value proposed per (ballot, slot). | `Checker`: registry ballot -> node from `Ballot()` when `Role() != Follower`; registry (ballot, slot) -> value from Accept messages seen in transit. | `replog.TestBallotIsUniquePerNode`; `sim.*`. |
-| S5 | Durability across crash: after restart from its store, a node's `Promised()` is at least its pre-crash value, every pre-crash accepted pvalue is present, and S1..S4 continue to hold. A torn write leaves the previous durable record, never a partial one. | The simulator keeps each node's `MemStore` across a crash; `Checker` compares post-restart state with the pre-crash snapshot. `TornWriteP` makes a `Save*` call fail after the crash decision so the volatile update is lost and the store keeps the old value. | `replog.TestRestartRestoresDurableState`; `wal.TestTornTail`; `sim.TestScenarios/crash_restart_storm`. |
+| S5 | Durability across crash: after restart from its store, a node's `Promised()` is at least its pre-crash value, every pre-crash accepted pvalue is present, and S1..S4 continue to hold. A torn write leaves the previous durable record, never a partial one. | The simulator keeps each node's `MemStore` across a crash; `Checker` compares post-restart state with the pre-crash snapshot. `TornWriteP` makes a `Save*` call fail after the crash decision so the volatile update is lost and the store keeps the old value. | `replog.TestRestartRestoresDurableState`; `wal.TestTornTail`; `wal.TestNodeRestartsFromFile`; `sim.TestScenarios/crash_restart_storm`; `cmd/arena.TestAttackRestartedReplicaForgetsAcknowledgedCreate`. |
 | S6 | Gap rule: a slot chosen after a higher slot was chosen contains a no-op. | `Checker`: record the maximum chosen slot over time; when a lower slot becomes chosen later, assert `Entry.NoOp()`. | `replog.TestTakeoverFillsGapsWithNoOps`; `sim.*`. |
 | S7 | Reads are not stale: a consistent read returns an `Index` at least the highest slot chosen anywhere before `ReadIndex` was called, and the state served was applied at least through that index. | `Checker` records the global maximum chosen slot at each `ReadIndex` call and compares with the `ReadReady.Index` later delivered for that seq. | `replog.TestReadIndexNeedsMajorityAtOwnBallot`; `replog.TestReadIndexRefusedBeforeLeadershipNoOp`; `sim.TestScenarios/partition_and_heal` (reads issued on both sides). |
 | S8 | At-most-once per idempotency key: for every key, exactly one non-replayed `Result` is produced, on every node, regardless of how many slots carry a command with that key. | `Checker` counts `Applied` records with `Result.Replayed == false` per (node, key). | `tournament.TestApplyReplaysRecordedResult`; `tournament.TestKeyReusedWithDifferentPayload`; `sim.TestScenarios/client_retry_storm`. |
@@ -1326,7 +1388,7 @@ tournament at the moment its Settle was applied.
 | D3 | A settled tournament never changes: the record returned by `Tournament(id)` and the postings returned by `ForTournament(id)` after Settle are byte-identical at every later step, on every node. | `Checker` snapshots the canonical encoding at the apply that set Status Settled; `AfterEvent` compares on every later event. | `tournament.TestSettledTournamentRejectsAllCommands` (Join, SubmitScore, Close, Settle with new keys are rejected with no postings); `sim.*`. |
 | D4 | Standings are a function of the accepted scores and the tie-break rule: `ComputeStandings` on the Closed record reproduces the stored `Standings`. | `Checker.AfterEvent` on every Closed/Settled tournament. | `tournament.TestStandingsTable` (ties, unscored entrants, single entrant, zero scores). |
 | D5 | Eligibility recorded: no `Entry` has a jurisdiction in the creation-time list or an age below `MinAge`; every `Entry.ExclusionVersion` equals `Rules.Exclusions.Version`; every Withheld payout's player is in the Settle-time list and every Prize payout's player is not; every Payout carries the Settle-time version. | `Checker.AfterEvent`. | `tournament.TestJoinEligibility`; `tournament.TestSettleWithholdsNewlyExcluded`. |
-| D6 | Money never appears or disappears: `Ledger().Check()` (sum of all balances is zero, every amount positive) on every node after every apply. | `Checker.AfterEvent`. | `ledger.TestCheck`. |
+| D6 | Money never appears or disappears inside the book: every amount positive, keys unique, every cached balance equal to the balance recomputed from the postings, and the balances sum to zero. It cannot tell a posting that should exist but does not; D1 and D2 cover that, and the state machine rejects a command whose posting key exists (`ledger_conflict`). | `Checker.AfterEvent`: `Ledger().CheckBalances()` after every apply, `Ledger().Check()` every 64 applies; `Checker.AtEnd`: `Check()` on every node. | `ledger.TestCheck`; `tournament.TestLedgerConflictIsARejection`. |
 
 ### 6.3 Liveness, under a stated fairness assumption
 
@@ -1338,9 +1400,10 @@ crashed nodes restarted, faults stopped), and requires that within
 `LivenessSteps` every client workflow reaches Settled and every node's applied
 slot reaches the commit index. `sim.TestLivenessWithFrozenMinority` heals only
 a majority core and freezes every fault outside it, then requires the same
-progress from the core. Both count voting members and fail if fewer than
-`Nodes` replicas participated in the final round, so a misconfigured member is
-not masked.
+progress from the core. Both count voting members, so a misconfigured
+member is not masked: `TestLivenessAfterHeal` fails if fewer than `Nodes`
+replicas participated in the final round, `TestLivenessWithFrozenMinority`
+if fewer than the members of the healed core did.
 
 ### 6.4 Testing the tester
 
@@ -1373,8 +1436,9 @@ checker fails to catch is a checker bug and blocks the milestone.
 - `internal/transport`: `Network` statistics match the configured
   probabilities within tolerance over 100 000 sends at a fixed seed; blocked
   pairs deliver nothing; `Purge` removes in-flight messages; `HTTP` delivers
-  across two `httptest` servers and drops rather than blocks when a peer is
-  down (under `testing/synctest`).
+  across two `httptest` servers, drops rather than blocks when a peer is
+  down, coalesces queued retransmissions of large messages, and admits an
+  `Accept` carrying `replog.MaxValueBytes` (real time, not synctest).
 - `internal/replica`: `Runner` under `testing/synctest`: a submit resolves
   when the key is applied from a different slot than proposed; a submit fails
   with `ErrLeadershipLost` on step-down; `Read(consistent)` waits for the
@@ -1387,9 +1451,13 @@ checker fails to catch is a checker bug and blocks the milestone.
   `Decode(Encode(x)) == x` on the seed corpus); `sim.FuzzSeed` treats the
   input as a run seed for a short random run.
 
-CI runs `go test -race -count=1 -shuffle=on ./...` with the seed sweep
-limited to 50 seeds per scenario; `make sim-long` runs 1000 seeds per scenario
-locally.
+- Adversarial tests (`adversarial_test.go` and `*_review_test.go` in
+  several packages) attack one guarantee each and sweep fault schedules the
+  scenarios do not use; the ones that found defects run by default.
+
+CI runs `go test -race -count=1 -shuffle=on -timeout 20m ./...` with the
+seed sweep limited to 50 seeds per scenario; `make sim-long` runs 1000 seeds
+per scenario locally.
 
 ---
 
@@ -1406,7 +1474,7 @@ generator with the probabilities in `Params`.
 | `dueling_leaders` | 3 or 5 nodes. Node A leads. Block A -> B and A -> C heartbeats (asymmetric) so B's election fires while A still believes it leads and keeps accepting client commands; then unblock. Repeat with the lease disabled (`LeaseDuration = 0`) to exercise the pure protocol, and enabled to exercise the lease. | S1, S3, S4: no slot has two values; A's proposals after B's ballot was promised by a majority are never chosen; every client command submitted to A during the duel is eventually applied exactly once via retry (S8) or rejected as not-leader; with the lease enabled, the number of leader changes is bounded by the number of partitions. |
 | `partition_and_heal` | 5 nodes. Split {leader, one follower} from {three followers} during a tournament with joins and score submissions in flight; clients on both sides keep submitting and reading; heal after a random interval; also a non-transitive split (A sees B and C, B does not see C). | S1, S2, S7: nothing proposed by the minority-side old leader after the split is chosen unless re-proposed by the majority leader; consistent reads on the minority side fail or wait rather than answer stale; after heal, the minority nodes converge to the majority's hash; D1-D3. |
 | `duplicated_and_reordered_messages` | `DupP = 0.3`, `MaxDelay = 20 * HeartbeatInterval`, `DropP = 0.1`, no crashes. Old Promises, Accepts, Accepted, Learns and HeartbeatAcks arrive after newer ballots exist. | S1, S3, S4, S6; a stale Accepted for an abandoned ballot never counts toward a quorum of the current ballot; a duplicate Learn is idempotent; S7. |
-| `client_retry_storm` | `RetryP = 0.8`: every client re-sends every command with the same key up to 10 times at random intervals, including after receiving a success, and sometimes with a mutated payload under the same key. Combined with `DropP = 0.2`. | S8: one non-replayed result per key; mutated payloads answered `key_reused` with no effect; D2: no duplicate fee, prize or refund postings; the log may contain several entries per key and the state machine applies one. |
+| `client_retry_storm` | `RetryP = 0.8`: a client re-sends a completed command with probability 0.8, then up to 10 times at random intervals with the same key, including after receiving a success, and sometimes with a mutated payload under the same key. Combined with `DropP = 0.2`. | S8: one non-replayed result per key; mutated payloads answered `key_reused` with no effect; D2: no duplicate fee, prize or refund postings; the log may contain several entries per key and the state machine applies one. |
 | `crash_restart_storm` | `CrashP` high, `TornWriteP = 0.2`, restart after a random delay; a node may crash while it is Candidate, Leader with proposals in flight, or in the middle of `ApplyCommitted`. | S5 on every restart; S1-S4 throughout; replay from the store reproduces the hash (S2). |
 | `clock_skew` | Per-node offsets up to `ClockSkewMax = 10 * ElectionTimeoutMax` added to `now` before `Tick`, with lease enabled. | Safety (S1-S8) holds regardless; the test also records leader changes to show that skew only costs liveness. |
 | `late_learner` | One follower loses every Learn for 500 slots (directional block of Learn only), then reconnects. | It catches up through LearnRequest in batches of `LearnBatch`; S2 at the end; `CommitIndex` monotone. |
@@ -1469,10 +1537,11 @@ Deliverables: `README.md` following the outline in
 `docs/research/go-practice.md` section 10 with real command output;
 `docs/adr/` with one record per decision that changed during M1-M2 (at
 least: read index over lease reads, ledger inside the state machine,
-in-memory idempotency map as an optimization only); `.github/workflows/ci.yml`
+in-memory idempotency map as an optimization only); `.github/workflows/go.yml`
 (gofmt, vet, build, tidy -diff, test -race, matrix oldstable/stable,
-`GOTOOLCHAIN=local`); `Makefile` with `check` and `sim-long`; `LICENSE`;
-optional `internal/replog/wal` with `TestTornTail` if time allows.
+`GOTOOLCHAIN=local`, jobs skipped while the repository is private);
+`Makefile` with `check` and `sim-long`; `LICENSE`; `internal/replog/wal` with
+`TestTornTail` (added after review, required by `arena -peers`).
 
 Done when:
 - CI is green on the first push of `main`.
@@ -1487,11 +1556,12 @@ Done when:
 
 Stated so that the boundary of the system is explicit.
 
-- Persistence. The default store is in memory. The optional `wal.File` is an
-  append-only file with an fsync per record and a truncated torn tail on
-  load; there is no checksum per record beyond a length prefix and no
-  detection of a rolled-back file. A replica whose store is lost must be
-  given a new `NodeID`; rejoining under the old identity can break promises.
+- Persistence beyond a demonstration. The simulator's store is in memory.
+  `wal.File` is an append-only file with an fsync and a CRC-32C per record
+  and a truncated torn tail on open; it is never compacted, and there is no
+  detection of a rolled-back or deleted file. A replica whose store is lost
+  must be given a new `NodeID`; rejoining under the old identity can break
+  promises.
 - Membership changes. `Peers` is fixed at start. Adding, removing or
   replacing a replica is a restart of the whole cluster with a new
   configuration and an empty log.

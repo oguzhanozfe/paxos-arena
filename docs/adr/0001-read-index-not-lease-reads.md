@@ -35,7 +35,7 @@ read fails.
   sharing one round between reads issued between two heartbeats is not
   implemented.
 - A leader isolated in a minority cannot answer consistent reads; the read
-  fails with `ErrNotLeader` after the step-down or waits until the deadline.
+  fails with `NotLeaderError` after the step-down or waits until the deadline.
   Stale reads (`?read=stale`) remain available on every replica and carry
   `X-Arena-Applied-Slot`.
 - The barrier's heartbeat must not be mistaken for the leader's periodic

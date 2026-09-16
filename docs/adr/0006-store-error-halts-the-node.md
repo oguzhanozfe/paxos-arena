@@ -31,6 +31,6 @@ keeps the old record, and the restart loads exactly what a disk would have.
   a missing acceptor, which a majority tolerates.
 - S5 (durability across crash, torn writes keep the old record) is checked
   on every restart in `crash_restart_storm` and in the random schedule.
-- The only store shipped is `MemStore`. The design's append-only file store
-  with a truncated torn tail (`internal/replog/wal`) is not built; the
-  `Store` interface is where it would go.
+- Two stores ship: `MemStore` and, since 2026-09-17, the append-only file
+  store `internal/replog/wal`, whose write or sync error poisons the file so
+  that every later save fails the same way ([ADR 0011](0011-file-store-for-per-process-replicas.md)).

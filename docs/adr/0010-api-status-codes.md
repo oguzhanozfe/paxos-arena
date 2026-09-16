@@ -22,10 +22,18 @@ the implementation had to choose.
 | Same key, different command | `422`, code `key_reused` |
 | State-machine rejection | `409`, `application/problem+json` with the `tournament.Code` in `code` |
 | Wait for apply exceeds `RequestTimeout` | `504`, code `outcome_unknown`; the client retries with the same key |
+| Body over `MaxBody` (default 64 KiB), or a command whose canonical encoding exceeds `replog.MaxValueBytes` | `413`, code `body_too_large`; nothing proposed, nothing recorded |
+| Leader's proposal queue full (`replog.ErrBusy`) | `503`, code `unavailable`, `Retry-After: 1` |
+| Forwarded request answered by the leader | the leader's status, headers `Content-Type`, `Content-Length`, `Retry-After`, `X-Arena-Applied-Slot`, `X-Arena-Node`, and its whole body |
 
 The design describes forwarding for POSTs; consistent GETs are forwarded
 by the same rule because a follower cannot serve them. Stale GETs are never
-forwarded.
+forwarded. The forwarding client has a connection pool of its own
+(`ForwardConnsPerHost`, 256 open and idle connections per leader) rather
+than `http.DefaultTransport`, whose two idle connections per host made
+every concurrent forward open and close a TCP connection and exhausted the
+ephemeral ports under a few thousand requests a second. Until 2026-09-17 a
+forwarded answer was cut off at `MaxBody` under its success status.
 
 ## Consequences
 

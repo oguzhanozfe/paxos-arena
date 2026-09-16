@@ -458,104 +458,85 @@ Acceptance criteria
 
 ## Sources
 
-Publishers are described by role; the URL identifies them.
+Publishers are described by role. A URL is given only where the publisher
+is a regulator, an encyclopedia, a university or a paper's host, or an open
+project; for sources published by companies, law firms or individuals the
+entry gives the role and the title, and the URL is left out so that no
+company or person is named here.
 
 1. Skill-gaming platform developer documentation, legality of skill gaming
    (three elements of gambling, predominance and material element tests,
-   18+ and device location). https://docs.skillz.com/docs/legal-skillz/
+   18+ and device location).
 2. Law-firm explainer, games of skill versus games of chance (predominance
    versus material element tests).
-   https://kleinmoynihan.com/games-of-skill-v-games-of-chance-the-legal-analysis/
 3. Plain-English state-by-state guide to skill-gaming legality (2026); count
    of restricting states. Commercial blog; used only for the order of
-   magnitude. https://ataygames.com/blogs/is-skill-based-gaming-legal-in-your-state
+   magnitude.
 4. Skill-gaming platform developer documentation, random numbers and fairness
    (same sequence per player, single-component warning, real players only).
-   https://docs.skillz.com/docs/randomness/
 5. Skill-gaming platform developer documentation, requirements to unlock real
    prizes (seeded generator required, 65% skill threshold).
-   https://docs.skillz.com/docs/28.0.5/unlock-real-prizes/
 6. National gambling regulator, remote technical standards, RTS 7 generation
    of random outcomes (use in order received, no adaptive behaviour).
    https://www.gamblingcommission.gov.uk/standards/remote-gambling-and-software-technical-standards/rts-7-generation-of-random-outcomes
 7. Law professor's case note on the 2025 summary-judgment ruling in the
    skill-gaming bot suit (liquidity bots, tailored bots, court's remarks).
-   https://tushnet.com/2025/10/30/claims-about-game-providers-bot-use-in-fair-and-skill-based-games-must-go-to-trial/
 8. Legal trade journal report of the 2026 jury verdict (bots posting
    preselected scores, $420 million damages).
-   https://ccbjournal.com/news/king-spalding-secures-record-false-advertising-win-for-skillz
 9. Law professor's case note on the 2024 motion-to-dismiss ruling ("fair" and
    "skill-based" may imply human-only competition).
-   https://tushnet.com/2024/07/29/fair-and-skill-based-may-falsely-imply-absence-of-bots-in-online-gaming/
 10. Advertising-law blog, bots and false advertising (implicit representations).
-    https://www.kelleydrye.com/viewpoints/blogs/ad-law-access/bots-and-false-advertising
 11. Skill-gaming platform developer documentation, tournaments and gameplay
     parameters (asynchronous matching, score held until a similar-rating
     opponent enters, tournament shapes).
-    https://docs.skillz.com/docs/tournaments-and-gameplay-parameters/
 12. Skill-gaming platform developer documentation, aborted matches and
-    forfeits. https://docs.skillz.com/docs/aborts/
+    forfeits.
 13. Encyclopedia entry, rake in poker (definition; tournament buy-in plus fee).
     https://en.wikipedia.org/wiki/Rake_(poker)
 14. Skill-gaming platform annual report for fiscal 2024 (entry-fee revenue
     share, prior winnings share of entry fees, states where cash prizes are not
     enabled, matching real players).
-    https://www.sec.gov/Archives/edgar/data/1801661/000180166125000050/sklz-20241231.htm
 15. Skill-gaming platform developer documentation, developer-funded live
     events (70% share, pre-funded prize pool, placement prizes).
-    https://docs.skillz.com/docs/developer-funded-live-events/
 16. Payments company engineering blog, idempotency keys in payment APIs
     (idempotency key as uniqueness constraint on ledger postings).
-    https://dodopayments.com/blogs/idempotency-keys-payment-api
 17. Engineering blog, designing a payment ledger (double-entry, idempotency
     per attempt, append-only, reconciliation).
-    https://dev.to/gabrielanhaia/design-a-payment-ledger-idempotent-audit-compliant-reconciles-to-the-cent-59p7
 18. Game-networking tutorial, client-server game architecture (authoritative
     server, clients send actions).
-    https://www.gabrielgambetta.com/client-server-game-architecture.html
 19. Game-backend vendor blog, server-authoritative game logic.
-    https://accelbyte.io/blog/server-authoritative-logic-to-prevent-cheating
 20. Mobile application security verification standard, resilience chapter
     (defence in depth; server-side validation).
     https://raw.githubusercontent.com/OWASP/owasp-masvs/master/Document/11-MASVS-RESILIENCE.md
     (rendered at https://mas.owasp.org/MASVS/11-MASVS-RESILIENCE/)
 21. Skill-gaming platform developer documentation, core loop and score
     submission (submit score, fallback).
-    https://docs.skillz.com/docs/next/play-and-compare-gameplay/
 22. Skill-gaming platform developer documentation, anti-cheating techniques
     (duplicate-and-verify, obfuscation; platform measures plus developer
-    measures). https://docs.skillz.com/docs/anti-cheating-techniques-overview/
+    measures).
 23. Game-networking blog, deterministic lockstep (definition of determinism).
-    https://gafferongames.com/post/deterministic_lockstep/
 24. Game-tooling blog, debugging leaderboard score anomalies (input replay,
     determinism obstacles, statistical flags, false positives).
-    https://bugnet.io/blog/debugging-leaderboard-anomalies
 25. Game-networking blog, floating point determinism.
-    https://gafferongames.com/post/floating_point_determinism/
 26. Baughman and Levine, "Cheat-Proof Playout for Centralized and Peer-to-Peer
     Gaming", IEEE/ACM Transactions on Networking (lockstep protocol with hash
     commitments). http://forensics.umass.edu/pubs/baughman.ToN.pdf
 27. National gambling regulator, RTS 11 limiting collusion and cheating.
     https://www.gamblingcommission.gov.uk/standards/remote-gambling-and-software-technical-standards/rts-11-limiting-collusion-and-cheating
 28. Distributed-systems blog, "You Cannot Have Exactly-Once Delivery".
-    https://bravenewgeek.com/you-cannot-have-exactly-once-delivery/
 29. Payment processor API reference, idempotent requests.
-    https://docs.stripe.com/api/idempotent_requests
 30. Microservice pattern catalogue, transactional outbox.
-    https://microservices.io/patterns/data/transactional-outbox.html
 31. National gambling regulator, RTS 10 interrupted gambling.
     https://www.gamblingcommission.gov.uk/standards/remote-gambling-and-software-technical-standards/rts-10-interrupted-gambling
 32. National gambling regulator, RTS 5 result determination.
     https://www.gamblingcommission.gov.uk/standards/remote-gambling-and-software-technical-standards/rts-5-result-determination
 33. In-memory data store vendor tutorial, real-time leaderboard with sorted
-    sets. https://redis.io/tutorials/howtos/leaderboard/
+    sets.
 34. In-memory data store documentation, replication (asynchronous by default,
     WAIT semantics, replication history after failover).
-    https://redis.io/docs/latest/operate/oss_and_stack/management/replication/
 35. Distributed-systems testing project, consistency model reference,
     linearizability. https://jepsen.io/consistency/models/linearizable
 36. Software-architecture pattern catalogue, Event Sourcing.
-    https://martinfowler.com/eaaDev/EventSourcing.html
 37. National gambling regulator, RTS security requirements (systems in scope;
     ISO/IEC 27001 logging and clock synchronisation controls).
     https://www.gamblingcommission.gov.uk/standards/remote-gambling-and-software-technical-standards/4-remote-gambling-and-software-technical-standards-rts-security-requirements
@@ -564,10 +545,9 @@ Publishers are described by role; the URL identifies them.
     https://www.gamblingcommission.gov.uk/standards/remote-gambling-and-software-technical-standards/rts-1-customer-account-information
 39. Skill-gaming operator eligibility page (18 or higher local minimum,
     identity and location verification, location checks at deposit, entry and
-    withdrawal). https://skillrcash.com/eligibility
+    withdrawal).
 40. Law-firm note on the 2026 change to the US prize information-return
     threshold ($600 to $2,000).
-    https://www.reedsmith.com/our-insights/blogs/viewpoints/102ku4y/one-big-beautiful-bill-act-could-mean-more-valuable-prizes/
 41. Ongaro and Ousterhout, "In Search of an Understandable Consensus Algorithm
     (Extended Version)" (replicated log definition, terms as logical clock,
     safety properties). https://raft.github.io/raft.pdf
@@ -576,8 +556,6 @@ Publishers are described by role; the URL identifies them.
     https://www.cs.cornell.edu/fbs/publications/SMSurvey.pdf
 43. Chandra, Griesemer and Redstone, "Paxos Made Live: An Engineering
     Perspective" (master leases, epoch numbers).
-    https://research.google/pubs/paxos-made-live-an-engineering-perspective-2006-invited-talk/
-    (PDF mirror: https://systems.cs.columbia.edu/ds2-class/papers/chandra-paxos.pdf)
-44. Kleppmann, "How to do distributed locking" (fencing tokens; use a consensus
-    system for correctness-critical locks).
-    https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html
+    https://systems.cs.columbia.edu/ds2-class/papers/chandra-paxos.pdf
+44. Distributed-systems blog post, "How to do distributed locking" (2016;
+    fencing tokens; use a consensus system for correctness-critical locks).

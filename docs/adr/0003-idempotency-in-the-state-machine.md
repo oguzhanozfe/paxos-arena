@@ -27,14 +27,24 @@ Two layers above it are optimisations only and never the authority:
 - `replica.Runner.Submit` answers a key already present in the local results
   table without proposing, also on a follower. The answer is the recorded
   result, which is what the log would have produced.
+- `replica.Runner` wakes a pending `Submit` when a command with its key is
+  applied, and hands it that command's result only when the fingerprints
+  match. Two submissions under one key with different payloads can be
+  pending together (a client that timed out and retried with an edited body,
+  or two clients that chose the same key); the one whose command was not the
+  one applied is answered `key_reused`, as its own application will be.
+  (Added 2026-09-17 after a review found the second caller told `ok` for a
+  command that never took effect.)
 
 ## Consequences
 
 - The log may contain several entries with one key (a command that lost its
   slot and was re-proposed by the client's retry). The state machine applies
   the first and replays for the rest. The simulator's `client_retry_storm`
-  scenario sends every command up to ten times, 30% with a mutated payload,
-  and S8 counts exactly one non-replayed result per key per node.
+  scenario re-sends 80% of completed commands up to ten times, some with a
+  mutated payload, and S8 counts exactly one non-replayed result per key per
+  node. Its `replays` and `key_reused` counters count applications on every
+  replica, not client requests.
 - A replayed success returns the original status with `"replayed": true`;
   `key_reused` is `422`.
 - The table grows without bound for the life of the process (design section

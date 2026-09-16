@@ -17,8 +17,8 @@ process, connected by the in-process bus `transport.Local`, each with its
 own HTTP listener on consecutive ports from `-listen` (port 0 picks free
 ports). It prints the `curl` commands for a complete tournament. With `-id`
 and `-peers` it runs one replica over `transport.HTTP`, as designed. The
-`-wal` flag of the design is not present because the file store is not
-built.
+`-wal` flag was added on 2026-09-17 and is required in that mode
+([ADR 0011](0011-file-store-for-per-process-replicas.md)).
 
 ## Consequences
 
@@ -28,4 +28,6 @@ built.
   `api.Server` run behind every port.
 - Killing one replica requires the per-process mode; in the one-process
   mode Ctrl-C stops all of them.
-- State is in memory in both modes and is lost when the process exits.
+- In the one-process mode state is in memory and is lost when the process
+  exits. In the per-process mode each replica's durable log state is in its
+  `-wal` file; the state machine is rebuilt from it on start.

@@ -20,6 +20,8 @@ test:
 	$(GO) test -count=1 ./...
 
 ## race: run the tests once under the race detector, in shuffled order (about 2 min).
+## internal/sim alone takes close to 2 min per -count under -race, so keep an
+## explicit -timeout above 10m when raising -count.
 race:
 	$(GO) test -race -count=1 -shuffle=on -timeout 15m ./...
 

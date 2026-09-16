@@ -218,7 +218,7 @@ Rules that follow from the sources:
 - "Never start a goroutine without knowing how it will stop": "Every time
   you use the go keyword in your program to launch a goroutine, you must
   know how, and when, that goroutine will exit."
-  ([Cheney, 2016](https://dave.cheney.net/2016/12/22/never-start-a-goroutine-without-knowing-how-it-will-stop))
+  (a Go blog post on goroutine lifetimes, 2016)
 - "Goroutines are not garbage collected; they must exit on their own."
   Pipeline stages "close their outbound channels when all the send
   operations are done" and cancellation is a broadcast via a closed channel.
@@ -686,7 +686,7 @@ Result submission moves money, so a retried POST must not settle twice.
   idempotency key, regardless of whether it succeeds or fails", returns
   that for later requests with the same key, prunes keys after 24 hours,
   errors when the parameters differ, and recommends V4 UUIDs of at most
-  255 characters. ([Idempotent requests](https://docs.stripe.com/api/idempotent_requests))
+  255 characters. (a payment processor's API reference on idempotent requests)
 
 Implementation in `internal/api`:
 
@@ -964,7 +964,7 @@ check:
   design (system-context diagram, API sketch, data storage), alternatives
   considered, cross-cutting concerns; "the design doc is the place to write
   down the trade-offs you made in designing your software".
-  ([Design Docs at Google, Ubl 2020](https://www.industrialempathy.com/posts/design-docs-at-google/))
+  (a design-docs essay by a web-framework engineer, 2020)
 - An Architectural Decision Record "captures a single AD and its
   rationale" so a reader can "understand the reasons for a chosen
   architectural decision, along with its trade-offs and consequences".
@@ -1121,7 +1121,7 @@ Prior art on deterministic simulation and fault injection
 - TigerBeetle, The VOPR: https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/internals/vopr.md
 - sled, Simulation guide: https://sled.rs/simulation.html
 - Jepsen tutorial, Nemesis: https://github.com/jepsen-io/jepsen/blob/main/doc/tutorial/05-nemesis.md
-- Idempotent requests in a public payments API: https://docs.stripe.com/api/idempotent_requests
+- Idempotent requests in a public payments API: a payment processor's API reference (URL omitted: its domain names the company)
 
 GitHub
 
@@ -1133,6 +1133,6 @@ GitHub
 
 Writing
 
-- Design Docs at Google (Malte Ubl, 2020): https://www.industrialempathy.com/posts/design-docs-at-google/
+- The anatomy of a design document: an essay by a web-framework engineer (2020; URL omitted: it names a company)
 - Architectural Decision Records: https://adr.github.io/
-- Never start a goroutine without knowing how it will stop (Dave Cheney, 2016): https://dave.cheney.net/2016/12/22/never-start-a-goroutine-without-knowing-how-it-will-stop
+- "Never start a goroutine without knowing how it will stop": a Go blog post on goroutine lifetimes (2016; URL omitted: its domain names the author)

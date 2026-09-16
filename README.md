@@ -9,7 +9,7 @@ idempotency keys. A deterministic simulator runs whole clusters in one
 goroutine under seeded crashes, partitions, message loss, duplication,
 reordering, torn writes and clock skew, and checks fourteen invariants after
 every event. The repository is a case study in consensus and fault-injection
-testing, not a production service: state lives in memory, membership is
+testing, not a production service: the log is never compacted, membership is
 fixed, and no money moves outside the ledger.
 
 Contents: [The problem](#the-problem) |
@@ -123,14 +123,18 @@ answers consistent reads.
     |<----------------------|  200 {result}                     |
 ```
 
-Packages and the dependency direction (enforced by `TestNoForbiddenImports`
-in `replog` and `tournament`, which inspect `go list -deps`):
+Packages and the dependency direction. The core packages' dependencies are
+enforced by `TestNoForbiddenImports` in `replog` (for `paxos` and `replog`)
+and `tournament` (for `ledger` and `tournament`), which inspect `go list
+-deps`; the edges above them are kept by review:
 
 ```
+  internal/jsonx       the one strict JSON decoding rule every codec and the API share
   internal/paxos       single-decree Paxos: Ballot, PValue, the rules (Quorum, MayPromise,
                        MayAccept, Choose) stated once, a reference acceptor and proposer
   internal/replog      Multi-Paxos log: Node (acceptor, learner, candidate, leader), lease,
                        heartbeats, read index, catch-up, Store/MemStore, strict JSON codec
+  internal/replog/wal  replog.Store on an append-only file: fsync per record, torn tail cut
   internal/ledger      append-only double-entry Book with idempotent postings
   internal/tournament  deterministic State: commands, validation, standings, pool, payouts,
                        results table keyed by idempotency key, canonical codec, hash chain
@@ -142,9 +146,12 @@ in `replog` and `tournament`, which inspect `go list -deps`):
   internal/sim         virtual clock, event heap, fault schedule, clients, scenarios, Checker
   cmd/arena            the service; cmd/chaos: the simulator's command line
 
-  paxos <- ledger <- tournament <- replica <- api
-  paxos <- replog  <- replica    <- sim
-  replog <- transport
+  paxos  <- ledger     <- tournament <- replica <- api <- cmd/arena
+  paxos  <- replog     <- replica    <- sim <- cmd/chaos
+  replog <- transport  <- sim, cmd/arena
+  replog <- replog/wal <- cmd/arena
+  replog, ledger, tournament <- api        ledger, tournament <- sim
+  jsonx  <- replog, replog/wal, tournament, api
 ```
 
 `paxos`, `replog`, `tournament`, `ledger` and `replica.Core` contain no
@@ -173,9 +180,19 @@ Protocol, in brief (details in `docs/DESIGN.md` sections 3 and 5):
   its own ballot, then waits until that index is applied
   ([ADR 0001](docs/adr/0001-read-index-not-lease-reads.md)).
 - Before replying, an acceptor persists its promise and every accepted value
-  through the `Store` interface. The only store shipped is in memory; a
-  store error halts the node instead of letting it answer
-  ([ADR 0006](docs/adr/0006-store-error-halts-the-node.md)).
+  through the `Store` interface. Two stores ship: `MemStore`, which the
+  simulator keeps across simulated crashes, and `replog/wal.File`, an
+  append-only file with an fsync per record and a torn tail cut off on open,
+  which `arena` requires when a replica runs in its own process. A store
+  error halts the node instead of letting it answer
+  ([ADR 0006](docs/adr/0006-store-error-halts-the-node.md),
+  [ADR 0011](docs/adr/0011-file-store-for-per-process-replicas.md)).
+- Every value travels whole in one `Accept`, so a value is bounded
+  (`replog.MaxValueBytes`, 1 MiB) and the HTTP transport's message limit
+  (16 MiB) is sized to carry it. A leader holds at most `Window` slots in
+  flight and `QueueLimit` (1 024) values waiting; beyond that `Propose`
+  answers `ErrBusy`
+  ([ADR 0012](docs/adr/0012-bounds-on-commands.md)).
 
 HTTP API (Go 1.22 method patterns; every POST requires `Idempotency-Key`;
 errors are RFC 9457 `application/problem+json` with a `code` member):
@@ -189,15 +206,20 @@ errors are RFC 9457 `application/problem+json` with a `code` member):
 | `POST /v1/tournaments/{id}/settle` | Settle: posts rake and payouts | 200 |
 | `GET /v1/tournaments/{id}` | record, standings, payouts (`?read=stale` from any replica) | 200 |
 | `GET /v1/tournaments/{id}/ledger` | postings of the tournament | 200 |
-| `GET /v1/node`, `GET /healthz` | replica status | 200 |
+| `GET /v1/node`, `GET /healthz` | replica status (`state_hash` in hex) | 200 |
 
 A repeated key with the same command returns the recorded result with
 `"replayed": true` and changes nothing; the same key with a different
 command is `422 key_reused`; a state-machine rejection is `409` with the
-rejection code; a follower forwards once to the leader it knows and answers
-`503` with `Retry-After` when it cannot
-([ADR 0003](docs/adr/0003-idempotency-in-the-state-machine.md),
-[ADR 0010](docs/adr/0010-api-status-codes.md)).
+rejection code; a body over 64 KiB, or a command whose encoding the log
+could not carry, is `413 body_too_large`; a follower forwards once to the
+leader it knows and relays its whole answer, and answers `503` with
+`Retry-After` when it cannot, as does a leader whose proposal queue is full.
+See [ADR 0003](docs/adr/0003-idempotency-in-the-state-machine.md) and
+[ADR 0010](docs/adr/0010-api-status-codes.md). Tournament and player
+identifiers are 1 to 64 characters from `A-Z`, `a-z`, `0-9`, `.`, `_` and
+`-`, which keeps the ledger's posting keys (`fee:<tid>:<pid>`) unambiguous
+([ADR 0012](docs/adr/0012-bounds-on-commands.md)).
 
 ## Running it
 
@@ -225,7 +247,7 @@ Repeating a POST with the same key returns the recorded result with "replayed": 
   curl -s -X POST $BASE/v1/tournaments -H 'Idempotency-Key: create-t1' -H 'Content-Type: application/json' \
     -d '{"id":"t1","rules":{"entry_fee":500,"rake_bps":1000,"prize_bps":[5000,3000,2000],"min_entrants":3, ...
   ...
-Ctrl-C stops every replica. State is in memory and is lost on exit.
+Ctrl-C stops every replica. In this mode state is in memory and is lost on exit.
 ```
 
 In another shell, the printed commands, trimmed. Node 1 was a follower here
@@ -352,21 +374,30 @@ HTTP/1.1 400 Bad Request
 {"type":"about:blank","title":"Bad Request","status":400,"detail":"every POST requires an Idempotency-Key header","code":"missing_idempotency_key"}
 ```
 
-The pool is 3 x 500 = 1500, the rake 10% = 150, the pool 1350, split 50/30/20
+The fees are 3 x 500 = 1500, the rake 10% = 150, the pool 1350, split 50/30/20
 into 675/405/270; the pool account nets to zero and every posting names the
-slot and the ballot under which this replica learned it.
+slot and the ballot under which this replica learned it. Under the `split`
+tie-break, equal scores share a place and pool the shares of the places they
+occupy; a tie that crosses the last paid place is cut off there, so with
+three prizes and scores 100, 90, 80, 80 both entrants on 80 stand in place 3
+but only the earlier submitter is paid.
 
-To kill a replica independently, run one replica per process over HTTP. The
+To kill a replica independently, run one replica per process over HTTP. In
+this mode each replica needs `-wal`, the append-only file that keeps its
+promise, accepted values and chosen entries: a replica restarted without its
+durable state would rejoin under its old identity having forgotten what it
+promised and acknowledged, so `arena` refuses to start without the flag. The
 run below created and closed a tournament through node 2, killed the leader
-(node 1) between `Close` and `Settle`, and settled through the survivors.
+(node 3) between `Close` and `Settle`, settled through the survivors, and
+restarted node 3 from its file.
 
 ```
 $ make build                         # bin/arena and bin/chaos
 $ PEERS=1=http://127.0.0.1:19081,2=http://127.0.0.1:19082,3=http://127.0.0.1:19083
-$ bin/arena -id 1 -listen 127.0.0.1:19081 -peers $PEERS -log-level warn &
-$ bin/arena -id 2 -listen 127.0.0.1:19082 -peers $PEERS -log-level warn &
-$ bin/arena -id 3 -listen 127.0.0.1:19083 -peers $PEERS -log-level warn &
-arena: node 2 of [1 2 3] listening on http://127.0.0.1:19082
+$ bin/arena -id 1 -listen 127.0.0.1:19081 -wal node1.wal -peers $PEERS -log-level warn &
+$ bin/arena -id 2 -listen 127.0.0.1:19082 -wal node2.wal -peers $PEERS -log-level warn &
+$ bin/arena -id 3 -listen 127.0.0.1:19083 -wal node3.wal -peers $PEERS -log-level warn &
+arena: node 2 of [1 2 3] listening on http://127.0.0.1:19082, durable state in node2.wal (commit index 0)
   node 1  http://127.0.0.1:19081
   node 2  http://127.0.0.1:19082
   node 3  http://127.0.0.1:19083
@@ -374,37 +405,44 @@ arena: node 2 of [1 2 3] listening on http://127.0.0.1:19082
 
 $ curl -s -i -X POST http://127.0.0.1:19082/v1/tournaments -H 'Idempotency-Key: create-t1' ... -d '{"id":"t1", ...}'
 HTTP/1.1 201 Created
-X-Arena-Node: 1                      # node 2 forwarded to the leader, node 1
+X-Arena-Node: 3                      # node 2 forwarded to the leader, node 3
 ...
 $ # joins, scores and close through node 2 as above, then:
-$ kill %1                            # node 1, the leader
+$ kill %3                            # node 3, the leader
 $ curl -s -i -X POST http://127.0.0.1:19082/v1/tournaments/t1/settle -H 'Idempotency-Key: settle-t1' ... \
     -d '{"exclusions":{"version":8,"jurisdictions":["XX","YY"]}}'
 HTTP/1.1 503 Service Unavailable
 Content-Type: application/problem+json
 Retry-After: 1
 X-Arena-Node: 2
-{"type":"about:blank","title":"Service Unavailable","status":503,"detail":"forward to node 1 failed: Post \"http://127.0.0.1:19081/v1/tournaments/t1/settle\": dial tcp 127.0.0.1:19081: connect: connection refused","code":"forward_failed","leader":1}
+{"type":"about:blank","title":"Service Unavailable","status":503,"detail":"forward to node 3 failed: Post \"http://127.0.0.1:19083/v1/tournaments/t1/settle\": dial tcp 127.0.0.1:19083: connect: connection refused","code":"forward_failed","leader":3}
 
-$ # about 300 ms later, the same request with the same key
+$ # 400 ms later, the same request with the same key
 $ curl -s -i -X POST http://127.0.0.1:19082/v1/tournaments/t1/settle -H 'Idempotency-Key: settle-t1' ... \
     -d '{"exclusions":{"version":8,"jurisdictions":["XX","YY"]}}'
 HTTP/1.1 200 OK
-X-Arena-Node: 2                      # node 2 is now the leader (ballot r2.n2)
+X-Arena-Node: 2                      # node 2 is now the leader
 { "code": "ok", "replayed": false, "slot": 11, "tournament": { ..., "status": "settled", "payouts": [ ...675, 405, 270... ] } }
 
-$ curl -s -i -X POST http://127.0.0.1:19083/v1/tournaments/t1/settle -H 'Idempotency-Key: settle-t1' ... -d '{...}'
+$ bin/arena -id 3 -listen 127.0.0.1:19083 -wal node3.wal -peers $PEERS -log-level warn &
+arena: node 3 of [1 2 3] listening on http://127.0.0.1:19083, durable state in node3.wal (commit index 9)
+$ curl -s -i 'http://127.0.0.1:19083/v1/tournaments/t1?read=stale'
 HTTP/1.1 200 OK
+X-Arena-Applied-Slot: 11             # the nine slots from its file, then the two it missed
 X-Arena-Node: 3
-{ "code": "ok", "replayed": true, "slot": 11, ... }
+{ "tournament": { ..., "status": "settled", ... } }
 
 $ diff <(curl -s http://127.0.0.1:19082/v1/tournaments/t1 | grep -v consistent) \
        <(curl -s 'http://127.0.0.1:19083/v1/tournaments/t1?read=stale' | grep -v consistent) && echo identical
 identical
 ```
 
-`cmd/arena/main_test.go` (`TestThreeNodesOverHTTP`) performs this sequence
-on `httptest` servers under `-race` and checks D1-D3 through the API.
+`cmd/arena/main_test.go` (`TestThreeNodesOverHTTP`) performs the
+kill-and-settle sequence on loopback servers under `-race` and checks D1-D3
+through the API; `cmd/arena/adversarial_test.go`
+(`TestAttackRestartedReplicaForgetsAcknowledgedCreate`) starts replicas
+through the command's own flag handling, restarts one from its file after
+the leader dies, and requires the acknowledged tournament to survive.
 
 ### `cmd/chaos`: the simulator
 
@@ -483,10 +521,12 @@ D5         231440   ok      eligibility checked and its list version recorded at
 D6         189152   ok      money never appears or disappears
 ```
 
-In `client_retry_storm` the clients re-sent every command up to ten times,
-30% of them with a mutated payload under the same key; across the ten runs
-the state machine applied each of the 1 297 keys once, answered 12 773
-replays and rejected 5 593 mutations as `key_reused`. Heavier loss works the
+In `client_retry_storm` the clients re-sent 80% of their completed commands
+up to ten times, 5 670 extra sends of which 1 738 carried a mutated payload
+under the same key. Across the three replicas of each of the ten runs the
+state machine applied each of the 1 297 keys once, and answered 12 773
+applications from the results table and 5 593 with `key_reused` (the
+counters count applications on every replica, not client requests). Heavier loss works the
 same way: `go run ./cmd/chaos -seed 42 -seeds 3 -nodes 5 -drop 0.3 -dup 0.2
 -steps 20000` dropped 27% of the messages sent, duplicated 13%, and settled
 all 142 tournaments of the three runs. A failing seed is replayed with the
@@ -495,7 +535,7 @@ seed produce byte-identical traces (`sim.TestReplayDeterministic`).
 
 ## How it is tested
 
-Three layers, all under the race detector in CI.
+Four layers, all under the race detector in CI.
 
 1. Table-driven unit tests per package, with property-style tests where the
    input space is large (1 000 random single-decree interleavings; 10 000
@@ -515,8 +555,22 @@ Three layers, all under the race detector in CI.
    of seeds that once failed; it is rerun by `TestSeedCorpus` on every run and
    is empty at the time of writing.
 3. Goroutine-level tests: `replica.Runner` under `testing/synctest`, the
-   HTTP transport and API on `httptest` servers, and `TestThreeNodesOverHTTP`
-   for the three-process demo.
+   HTTP transport and API on `httptest` servers, the file store against torn
+   and corrupted files, and `TestThreeNodesOverHTTP` for the three-process
+   demo.
+4. Adversarial tests written by reviewers, one file per package
+   (`adversarial_test.go`, `*_review_test.go`): each attacks one guarantee
+   (a chosen but unlearned value surviving a takeover, stale acceptances
+   counted toward a quorum, a proposer changing its value within a ballot,
+   identifiers that collide in posting keys, a waiter handed another
+   payload's result, a restarted process forgetting an acknowledged write,
+   oversized commands, abandoned requests, a data race between a handler
+   and the event loop, truncated forwarded responses) and sweeps fault
+   schedules the named scenarios do not use: heavy loss without the lease,
+   even cluster sizes, clock skew without the lease, extreme reordering,
+   partitions that flap faster than an election. The ones that found
+   defects run by default as regression tests; two load and determinism
+   sweeps run with `ARENA_REVIEW_REPRO=1`.
 
 The checker is itself tested: `sim.TestCheckerDetectsKnownBugs` turns on four
 planted bugs (`replog.UnsafeKnobs`: accept below the promise, ignore Phase 1
@@ -532,23 +586,24 @@ Invariants and where each is checked:
 | S2 | Identical applied sequences and state hashes on every node, including a node rebuilt by replay | `tournament.TestReplayDeterministic`, `replica.TestReplayFromStore` | hash compared per (node, applied slot); full replay at the end |
 | S3 | Promise never decreases; accepts only at or above the promise | `paxos.TestAcceptorRules`, `replog.TestAcceptorMonotonic` | every `Prepare`/`Accept` step |
 | S4 | Ballots unique per node; one value per (ballot, slot) | `replog.TestBallotIsUniquePerNode` | registry over `Accept`s in transit |
-| S5 | Durable state survives a crash; a torn write keeps the old record | `replog.TestRestartRestoresDurableState`, `replog.TestStoreFailureStopsNodeWithoutReplying` | every restart in `crash_restart_storm` and the random schedule |
+| S5 | Durable state survives a crash; a torn write keeps the old record | `replog.TestRestartRestoresDurableState`, `replog.TestStoreFailureStopsNodeWithoutReplying`, `wal.TestTornTail`, `wal.TestNodeRestartsFromFile` | every restart in `crash_restart_storm` and the random schedule |
 | S6 | A slot proposed after a higher slot was chosen is a no-op | `replog.TestTakeoverFillsGapsWithNoOps` | every scenario ([ADR 0007](docs/adr/0007-checker-definitions-under-pipelining.md)) |
 | S7 | A consistent read reflects every command completed before it | `replog.TestReadIndexNeedsMajorityAtOwnBallot`, `replog.TestReadIndexRefusedBeforeLeadershipNoOp`, `replica.TestReadConsistentSeesCompletedSubmit` | every consistent read, on both sides of partitions |
 | S8 | One non-replayed result per idempotency key per node; replays equal the record | `tournament.TestApplyReplaysRecordedResult`, `tournament.TestKeyReusedWithDifferentPayload` | every apply; `client_retry_storm` |
 | D1 | Pool = fees - rake; pool account nets to zero after settle | `tournament.TestComputePool`, `tournament.TestSettlePostings`, `ledger.TestBalancesSumZero` | every apply, every tournament, every node |
-| D2 | Every payout exactly once, summing to the pool | `tournament.TestPayoutRoundingSumsToPool` (10 000 cases), `TestSplitTieBreak`, `TestVoidRefunds`, `ledger.TestPostDuplicateKeyIsNoop` | every apply |
+| D2 | Every payout exactly once, summing to the pool | `tournament.TestPayoutRoundingSumsToPool` (10 000 cases), `TestSplitTieBreak`, `TestVoidRefunds`, `TestLedgerConflictIsARejection`, `TestIdentifierShape`, `ledger.TestPostDuplicateKeyIsNoop` | every apply |
 | D3 | A settled tournament never changes | `tournament.TestSettledTournamentRejectsAllCommands` | canonical encoding compared against the snapshot at settle |
 | D4 | Standings are a function of the scores and the tie-break rule | `tournament.TestStandingsTable` | recomputed on every closed tournament |
 | D5 | Eligibility checked and its list version recorded at entry and payout | `tournament.TestJoinEligibility`, `tournament.TestSettleWithholdsNewlyExcluded` | every apply; `exclusion_change_at_settle` |
-| D6 | Money never appears or disappears | `ledger.TestCheck` | `Ledger().Check()` on every node after every apply |
+| D6 | Money never appears or disappears inside the book: balances sum to zero and equal the balances recomputed from the postings | `ledger.TestCheck` | `CheckBalances` after every apply and the full `Check` every 64 applies and at the end, on every node |
 
 Liveness is not an invariant (no protocol guarantees it under unbounded
 faults). `sim.TestLivenessAfterHeal` runs the fault schedule, heals
 everything, and requires every workflow to settle and every node to catch up
 within a bound; `sim.TestLivenessWithFrozenMinority` heals only a majority
-core and freezes the faults outside it. Both fail if fewer than `Nodes`
-replicas took part.
+core and freezes the faults outside it. `TestLivenessAfterHeal` fails if
+fewer than `Nodes` replicas took part, `TestLivenessWithFrozenMinority` if
+fewer than the healed core did.
 
 The scenarios (`docs/DESIGN.md` section 7 gives the schedules):
 
@@ -558,7 +613,7 @@ The scenarios (`docs/DESIGN.md` section 7 gives the schedules):
 | `dueling_leaders` | asymmetric heartbeat blocks so a follower elects while the leader keeps accepting commands; lease on or off by seed | S1, S3, S4, S8; nothing from the deposed leader is chosen; elections bounded |
 | `partition_and_heal` | {leader, one follower} split from three followers, also a non-transitive split, clients on both sides | S1, S2, S7; minority reads fail or wait; convergence after heal |
 | `duplicated_and_reordered_messages` | 30% duplication, 10% loss, delays up to 20 heartbeat intervals | S1, S3, S4, S6, S7; stale messages never count |
-| `client_retry_storm` | every command re-sent up to 10 times, 30% mutated under the same key, 20% loss | S8, D2; one apply per key, `key_reused` for mutations |
+| `client_retry_storm` | 80% of completed commands re-sent 1 to 10 times, each copy mutated under the same key with probability 0.3; 20% loss | S8, D2; one apply per key, `key_reused` for mutations |
 | `crash_restart_storm` | high crash rate, 20% torn writes, crashes as candidate, leader with proposals in flight and between commit and apply | S5 on every restart, S1-S4 throughout, replay reproduces the hash |
 | `clock_skew` | per-node clock offset and rate in [0.5, 2] with the lease on | S1-S8 hold; skew costs only liveness |
 | `late_learner` | one follower loses every `Learn` for 500 slots, then reconnects | catch-up through `LearnRequest`; S2; commit index monotone |
@@ -574,21 +629,26 @@ $ go vet ./...
 $ go mod tidy -diff
 
 $ go test -race -count=1 ./...
-ok  	github.com/oguzhanozfe/paxos-arena/cmd/arena	2.039s
-ok  	github.com/oguzhanozfe/paxos-arena/cmd/chaos	11.329s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/api	2.044s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/ledger	1.697s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/paxos	3.257s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/replica	3.534s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/replog	2.686s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/sim	80.213s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/tournament	3.994s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/transport	6.733s
+ok  	github.com/oguzhanozfe/paxos-arena/cmd/arena	2.650s
+ok  	github.com/oguzhanozfe/paxos-arena/cmd/chaos	10.441s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/api	2.137s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/jsonx	1.845s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/ledger	2.636s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/paxos	3.877s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/replica	5.186s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/replog	38.146s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/replog/wal	3.651s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/sim	106.956s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/tournament	4.356s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/transport	6.576s
 ```
 
-The same suite passes with `-shuffle=on`; without `-race` the longest
-package (`internal/sim`) takes about 11 s. `make check` runs gofmt, vet,
-build, `go mod tidy -diff` and the
+That is 1 min 48 s of wall time on 18 cores; the reviewers' adversarial
+tests account for most of the `replog` time. The same suite passes with
+`-shuffle=on`; without `-race` it takes about 13 s. Under `-race`,
+`internal/sim` needs close to two minutes per `-count`, so raising `-count`
+needs a `-timeout` above Go's default of ten minutes, as `make race` and CI
+pass. `make check` runs gofmt, vet, build, `go mod tidy -diff` and the
 race run, which is what [`.github/workflows/go.yml`](.github/workflows/go.yml)
 runs on `ubuntu-latest` for Go 1.26.x and 1.27.x with `GOTOOLCHAIN=local`.
 There are no third-party linters: the standard-library constraint applies to
@@ -623,24 +683,36 @@ Each decision with the alternative it displaced. The ADRs in
   `testing/synctest` only for the goroutine layer. The core packages are
   pure, so no runtime support is needed to make them deterministic.
 - JSON over HTTP, `encoding/json` v1 with unknown fields, trailing data and
-  oversized bodies rejected by hand, rather than a binary protocol or
-  `encoding/json/v2` (which would raise the `go` line to 1.27).
+  oversized bodies rejected by one shared helper (`internal/jsonx`), rather
+  than a binary protocol or `encoding/json/v2` (which would raise the `go`
+  line to 1.27).
 - `go 1.26.0` in `go.mod`: the oldest supported release line, so the
   two-version CI matrix means something.
 - `cmd/arena` starts N replicas in one process by default, one HTTP port
   each, so the first run needs one command; the per-process mode over HTTP
-  is a flag away ([ADR 0008](docs/adr/0008-arena-runs-in-one-process-by-default.md)).
+  takes `-id`, `-peers` and a mandatory `-wal` file
+  ([ADR 0008](docs/adr/0008-arena-runs-in-one-process-by-default.md),
+  [ADR 0011](docs/adr/0011-file-store-for-per-process-replicas.md)).
+- Size bounds before the log, rules after it. A body over 64 KiB, or a
+  command whose encoding exceeds the log's value limit, is refused by the API
+  and never proposed; everything else, including rule violations, goes
+  through the log and is recorded under its key. Validating every rule
+  before proposing would keep more out of the log, but a rejection answered
+  outside the log is not recorded, so a retry of the key with a corrected
+  body would be applied instead of answered with `key_reused`
+  ([ADR 0012](docs/adr/0012-bounds-on-commands.md)).
 
 ## What is not done
 
 Each item is a boundary of the system as built, not an oversight.
 
-- Persistence. The only `Store` is in memory. A restarted `arena` process
-  starts empty, and a replica that lost its store must not rejoin under its
-  old identity. The simulator models durable state by keeping each node's
-  store across simulated crashes, so S5 is tested, but the append-only file
-  store with a truncated torn tail described in the design
-  (`internal/replog/wal`) is not built.
+- Durable storage beyond a demonstration. `replog/wal` appends one record per
+  save and never compacts, so the file grows for the life of the cluster and
+  a restart replays all of it; the state machine is not persisted and is
+  rebuilt from slot 1. A replica whose file is lost must not rejoin under its
+  old identity, and nothing detects it if an operator does so: the file
+  records its node and membership, but an empty file looks like a new
+  replica. The one-process mode keeps everything in memory.
 - Membership changes. `Peers` is fixed at start; adding or replacing a
   replica is a restart of the cluster with a new configuration and an empty
   log.
@@ -654,8 +726,13 @@ Each item is a boundary of the system as built, not an oversight.
   and does not authenticate its peers.
 - Transport. The one-process demo uses an in-memory bus. The HTTP transport
   is best effort: `Send` never blocks, a full per-peer queue drops the
-  message, and the protocol's retransmission covers the loss. No connection
-  pooling tuning, no backpressure beyond the queue.
+  message, and the protocol's retransmission covers the loss. Large messages
+  have a queue of their own and a retransmission of one still queued is
+  dropped, so heartbeats never wait behind them. Backpressure stops at the
+  queues and the leader's `QueueLimit`. A `Promise` carries every value its
+  acceptor accepted above the candidate's commit index in one message; a
+  candidate lagging by more than the 16 MiB message limit cannot collect
+  promises over HTTP until it has caught up through a leader.
 - The game. No rules engine, no deal generation beyond a 64-bit seed, no
   replay validation of input logs, no anomaly detection; `input_digest` is
   stored, not checked.
@@ -673,29 +750,31 @@ Each item is a boundary of the system as built, not an oversight.
   directly with the checker's global view; client histories are not exported.
 - Performance. No benchmarks beyond what the simulation needs, no load
   testing, no tuning of `Window` or timeouts beyond what makes the simulation
-  and the demo work. `internal/sim` takes about 80 s under `-race`.
+  and the demo work. Applying a command runs on the replica's event loop, so
+  a large command delays heartbeats; the 64 KiB body limit keeps that well
+  under an election timeout. `internal/sim` takes about 110 s under
+  `-race`.
 
 ## Further work
 
 In the order they would add the most.
 
-1. `internal/replog/wal`: an append-only file store behind the existing
-   `Store` interface, one length-prefixed record per save, fsync per write,
-   torn tail truncated on load, with a `TestTornTail`; then a `-wal` flag on
-   `arena`.
+1. Snapshots of `tournament.State` at a slot, and truncation of the log, the
+   results table and the `wal` file below it.
 2. Batching the read-index barrier: reads issued between two heartbeats
    share one round.
-3. Snapshots of `tournament.State` at a slot, and truncation of the log and
-   results table below it.
-4. Membership changes through the log (a configuration entry chosen like any
-   other, with the joint-majority rule during the transition).
-5. An external payout path: `PayoutIssued` and `PayoutConfirmed` commands, an
+3. Membership changes through the log (a configuration entry chosen like any
+   other, with the joint-majority rule during the transition), which would
+   also give a replica that lost its file a way back in under a new identity.
+4. An external payout path: `PayoutIssued` and `PayoutConfirmed` commands, an
    outbox driven by the leader with the ballot as a fencing token, and
    reconciliation against the provider.
-6. Exporting client histories from the simulator and checking them with a
+5. Exporting client histories from the simulator and checking them with a
    linearizability checker, as a second opinion on S7 and S8.
-7. TLS and peer authentication on the inter-replica transport; request
+6. TLS and peer authentication on the inter-replica transport; request
    authentication on the API.
+7. Splitting a large `Promise` across messages, so that the transport limit
+   bounds one value rather than a candidate's whole backlog.
 
 ## Sources
 
@@ -741,10 +820,12 @@ paxos-arena/
   LICENSE                       MIT
   Makefile                      build, test, race, lint, check, sim-long, fuzz
   .github/workflows/go.yml      gofmt, vet, build, tidy -diff, test -race on Go 1.26.x and 1.27.x
-  cmd/arena/                    the service: N replicas in one process, or one per process
+  cmd/arena/                    the service: N replicas in one process, or one per process with a wal file
   cmd/chaos/                    the simulator's command line
+  internal/jsonx/               strict JSON decoding shared by the codecs and the API
   internal/paxos/               single-decree Paxos rules, reference acceptor and proposer
   internal/replog/              Multi-Paxos log: Node, Config, Store, codec, UnsafeKnobs
+  internal/replog/wal/          append-only file Store with torn-tail truncation
   internal/transport/           Network (simulation), Local (in-process), HTTP (inter-process)
   internal/ledger/              double-entry Book with idempotent postings
   internal/tournament/          deterministic state machine, codec, standings/pool/payout functions
