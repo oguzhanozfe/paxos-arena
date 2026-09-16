@@ -78,6 +78,9 @@ type Runner struct {
 
 	mu     sync.RWMutex
 	status Status
+	// advanced is closed, and replaced, whenever the status snapshot's
+	// applied slot grows; WaitApplied waits on it. Guarded by mu.
+	advanced chan struct{}
 }
 
 // NewRunner wraps core. send is called on the event-loop goroutine for
@@ -95,6 +98,7 @@ func NewRunner(core *Core, send func(replog.Envelope), log *slog.Logger) *Runner
 		submits:      make(chan *waiter),
 		reads:        make(chan *readReq),
 		done:         make(chan struct{}),
+		advanced:     make(chan struct{}),
 		waiters:      make(map[tournament.IdempotencyKey][]*waiter),
 		pendingReads: make(map[uint64]*readReq),
 	}
@@ -214,6 +218,30 @@ func (r *Runner) Status() Status {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.status
+}
+
+// WaitApplied returns the applied slot of the status snapshot as soon as it
+// exceeds after: at once when it already does, otherwise when the event
+// loop applies further. It returns the snapshot's applied slot with ctx's
+// error when ctx ends first, and with ErrStopped once Run has returned. A
+// Read that starts after WaitApplied returned sees at least the slot it
+// returned.
+func (r *Runner) WaitApplied(ctx context.Context, after paxos.Slot) (paxos.Slot, error) {
+	for {
+		r.mu.RLock()
+		applied, advanced := r.status.Applied, r.advanced
+		r.mu.RUnlock()
+		if applied > after {
+			return applied, nil
+		}
+		select {
+		case <-advanced:
+		case <-ctx.Done():
+			return applied, ctx.Err()
+		case <-r.done:
+			return applied, ErrStopped
+		}
+	}
 }
 
 // --- event-loop internals ---
@@ -337,6 +365,10 @@ func (r *Runner) after(outs []replog.Envelope) {
 
 	st := r.core.Status()
 	r.mu.Lock()
+	if st.Applied > r.status.Applied {
+		close(r.advanced)
+		r.advanced = make(chan struct{})
+	}
 	r.status = st
 	r.mu.Unlock()
 
