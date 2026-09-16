@@ -368,7 +368,8 @@ paxos-arena/
     session/                    HMAC session tokens and device verifiers (milestone 4)
     intent/                     the play API for game clients (milestone 4)
     sim/                        virtual clock, event heap, fault schedule, clients, invariant checker
-  unity-client/                 C# client SDK layout (milestone 4, README only)
+  unity-client/                 C# client SDK, its harness and compile checks (milestone 4)
+  scripts/e2e.sh                the SDK harness against three arena processes (milestone 4)
   docs/
     DESIGN.md                   this document
     UNITY-INTEGRATION.md        the milestone 4 contract
@@ -392,6 +393,7 @@ replog, ledger, tournament <- api        ledger, tournament <- sim
 jsonx  <- replog, replog/wal, tournament, api
 game   <- tournament
 game, ledger, paxos, replica, replog, session, tournament <- intent <- cmd/arena
+game, intent, session <- sim
 ```
 
 `internal/paxos`, `internal/replog`, `internal/tournament`, `internal/ledger`
@@ -1494,6 +1496,12 @@ generator with the probabilities in `Params`.
 Every scenario runs first in safety mode with faults, then calls `Heal()` and
 runs in liveness mode (section 6.3). Safety violations fail immediately;
 liveness failures fail at the bound.
+
+Milestone 4 adds five scenarios for the play commands of game clients
+(`duplicate_intents_after_leader_change`, `stale_sequence_replay`,
+`partition_during_payout_claim`, `token_expiry_mid_round`,
+`deal_during_leader_change`) and the invariants P1-P6 they check, specified
+in `docs/UNITY-INTEGRATION.md` section 12.
 
 ---
 

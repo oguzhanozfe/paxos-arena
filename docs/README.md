@@ -12,7 +12,7 @@ leader, lease for elections only, read-index reads), package layout and
 public types, the nine protocol messages, acceptor and leader rules as
 pseudocode, the tournament commands with their validation order, the ledger
 record, the fourteen invariants (S1-S8, D1-D6) with where each is checked,
-the nine chaos scenarios, milestones and non-goals. Written before the
+the nine chaos scenarios of the settlement log, milestones and non-goals. Written before the
 implementation; where the implementation deviates, an ADR records it and
 the ADR takes precedence over the affected paragraph.
 
@@ -27,9 +27,11 @@ play, with its deal committed to the log before any card is shown; the six
 play commands and their validation order; every route with its JSON bodies,
 status codes, error body, leader redirect and rate limits; the JSON rules a
 `JsonUtility` client needs; the client's caching, resend, backoff, clock and
-election rules; the Go functions and flags to build; the C# SDK layout; new
-invariants and chaos scenarios; and test vectors. So far only the Go types
-and `unity-client/README.md` exist.
+election rules; the Go functions and flags to build; the C# SDK layout; the
+play invariants P1-P6 and five chaos scenarios; and test vectors. The server
+side, the SDK in `unity-client/`, the simulator's play scenarios and
+`scripts/e2e.sh` implement it; section 13.1 records what the implementation
+settled.
 
 ## `adr/`
 

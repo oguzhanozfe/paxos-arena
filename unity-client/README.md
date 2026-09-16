@@ -250,7 +250,23 @@ dotnet run --project "unity-client/Tests~/Harness/Harness.csproj" -- \
 `--kill-leader-command` runs CMD in the middle of round 2 and requires the
 flow to finish anyway. That only makes sense with one replica per process
 (`arena -id N -peers ... -wal ... -play-listen ... -play-urls ...`), where CMD
-kills the leader's process and the other two keep a majority.
+kills the leader's process and the other two keep a majority. The harness
+runs it while a move's answer is undelivered, rebuilds player 0's client
+from its store, and requires the resend to fail on the killed leader, follow
+a follower's `307` and come back from the new leader as a replay. It needs
+one `--operator` URL per `--play` URL, in node order.
+
+Besides the steps of contract section 11.6, the live flow plays one illegal
+move (`409 illegal_move`, the number consumed, the board unchanged), sends
+the last move's body under a new key (`409 stale_seq`), and reads the
+tournament's ledger through the operator API at the end: exactly one claim
+posting per paid player.
+
+`scripts/e2e.sh` (or `make e2e`) does all of this unattended: it builds
+`arena` and the harness, starts three replicas as processes on `127.0.0.1`,
+runs the flow, runs it again with the leader killed by `SIGKILL`, restarts
+the killed replica from its wal file, and checks that every replica reports
+the same state hash. It prints a `SKIP` line and exits 0 without a .NET SDK.
 
 The unit tests cover backoff and `Retry-After`, the server clock, the session
 at start and its credentials, and intents that are stored before sending and

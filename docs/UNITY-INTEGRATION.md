@@ -7,7 +7,10 @@ Status: contract for milestone 4, written 2026-09-17. The server side
 `replica.Runner.WaitApplied` and the play flags of `cmd/arena`; the few
 places where the implementation settled a detail this document left open
 are recorded in section 13.1. The client SDK of section 11 is built
-separately in `unity-client/`.
+separately in `unity-client/`. The invariants and chaos scenarios of
+section 12 are implemented in `internal/sim` and `cmd/chaos`, and
+`scripts/e2e.sh` runs the harness of section 11.6 against three `arena`
+processes, once with a leader killed mid-round.
 
 This document is written for two implementers who work in parallel without
 talking to each other:
@@ -2143,9 +2146,36 @@ The flow, each step asserted, exit code 0 when all pass:
 8. Claims: each paid player claims; the sum equals the pool minus withheld
    amounts; a new key is `already_claimed`; the same key is replayed.
 
+Step 3 also plays one column the rules refuse (player 0, at the first view
+that has one): `409 illegal_move`, `X-Arena-Next-Seq` one above the rejected
+number, the board unchanged, no resynchronisation. Step 4 compares the
+replayed response with the first one byte for byte except `replayed`,
+including `X-Arena-Slot` and `X-Arena-Next-Seq`, and sends the last move's
+body under a new key (`409 stale_seq`, answered identically when resent
+with that key). Step 8 ends with the tournament's ledger read through the
+operator API: one fee per entrant, one prize posting per paid place, every
+posting key once, and exactly one claim posting per paid player for the
+claimed amount.
+
 With `--kill-leader-command CMD` the harness runs CMD (for example a
 `kill` of the leader's process) in the middle of step 3 and requires the
-flow to finish anyway.
+flow to finish anyway. It does so while a move is unanswered: player 0's
+client stores and sends the move, the leader applies it and answers, the
+answer is not handed to the client, CMD kills the leader, and the client is
+disposed as the app would die. A client rebuilt from the same store, with
+the killed leader still cached and base URLs ordered killed leader,
+follower, new leader, must resend the move with its key, get no response
+from the killed leader, follow the follower's `307`, and receive the
+recorded result from the new leader with `replayed` true and the first
+answer's slot. This needs one `--operator` URL per `--play` URL, in node
+order.
+
+`scripts/e2e.sh` builds `arena` and the harness, starts three replicas as
+separate processes on `127.0.0.1` with `-wal` and `-play-listen`, runs the
+flow, runs it again with a CMD that kills the ready leader with `SIGKILL`,
+restarts the killed replica from its wal file, and requires every replica to
+report the same applied slot and state hash after each run. It prints a
+`SKIP` line and exits 0 when no .NET SDK is installed.
 
 ---
 
@@ -2170,7 +2200,31 @@ New scenarios for `cmd/chaos` and `sim.TestScenarios`:
 | `duplicate_intents_after_leader_change` | the leader crashes after proposing a move and a claim; the client resends both keys to the new leader, and the old proposals are later re-proposed in higher slots | S8, P1, P2: one application per key, replays identical, no extra claim |
 | `stale_sequence_replay` | a client replays earlier intents under new keys and sends skipped numbers, during partitions | P2: all rejected, no state change beyond the results table |
 | `partition_during_payout_claim` | the leader is partitioned from the majority while claims are in flight; clients retry on both sides | P1, D6: exactly one claim each; the minority leader's proposals are not chosen |
+| `token_expiry_mid_round` | a player's app is suspended in the middle of a round, with a move stored and a session request in flight, for longer than the token lives; the leader crashes meanwhile | the resent move is refused `session_expired`, the replayed session carries an expired token, a session with a new key follows, and the move is then applied with its key and number (P2) |
 | `deal_during_leader_change` | leadership changes between proposing a `StartRound` and applying it | P3, P5: no view before the apply; a retry deals the same cards |
+
+How the simulator implements them. `internal/sim` has play clients beside
+its operator clients; the play scenarios run play clients only. A play client creates a `ladder-v1` tournament, then
+for each of its players opens a session, enters, deals round 1, sends two to
+eight moves (about one in seven names a column the rules refuse and must
+be answered `illegal_move`) and finishes the round; it closes and settles the
+tournament and claims every player's payout, sometimes twice. Rounds 2 and 3
+are never dealt, so `Close` scores each entry with round 1 (4.5). The
+client talks to each node through a model of the play API: a follower
+redirects, the leader verifies the token at its own clock, draws the player
+id of a session, derives the seed of a deal from a simulation deal secret,
+stamps `received_at`, proposes, and builds every round view with
+`intent.BuildRoundViewAt` as of the result. Play clients also read round
+views from random replicas, including ones that have not applied the deal.
+The checker evaluates P1, P2, P4, P5 and P6 after every applied play
+command on every node, P1, P4 and P5 again on every play tournament of
+every live replica at the end of the run, P3 on every view built, and S2
+once more at the end: every live replica at the same applied slot holds the
+same state hash. In
+`partition_during_payout_claim` it also fails the run when a replica cut off
+with the old leader commits a slot that no majority acceptor had accepted
+at the split. `sim.TestPlayInvariantsCatchPlantedFaults` plants a fault for
+P1, P2, P3, P5 and P6 and requires the checker to report it.
 
 Tests the implementations add:
 
@@ -2241,6 +2295,19 @@ Tests the implementations add:
   claim postings out of a settled tournament's snapshot: a claim is the one
   posting that follows a settlement, and it moves money out of a player
   account, not out of the tournament.
+- Settled with the simulator and the end-to-end run. The play invariants
+  are evaluated for play commands only, so the operator scenarios and the
+  random schedule, which send none, report the fourteen invariants they did
+  before and `cmd/chaos` prints P1-P6 only when a run evaluated them. P5
+  checks seeds against the simulation's own deal secret. A play scenario
+  deals round 1 of each entry only; the rules of rounds 2 and 3 are the
+  same code, which the unit tests and the end-to-end run cover. The
+  scenario list adds `token_expiry_mid_round` to the four planned ones: a
+  token that expires while a round is in play is the one session path the
+  other scenarios never reach. The harness's `--kill-leader-command` step kills the
+  leader while a move's answer is undelivered and rebuilds the client from
+  its store, rather than killing it between two moves, so the resend is a
+  replay of a result recorded by the killed leader.
 
 ### 13.2 Not covered
 

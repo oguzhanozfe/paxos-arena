@@ -8,9 +8,10 @@ state machine that owns a double-entry ledger, and expose an HTTP API with
 idempotency keys. A deterministic simulator runs whole clusters in one
 goroutine under seeded crashes, partitions, message loss, duplication,
 reordering, torn writes and clock skew, and checks fourteen invariants after
-every event. The repository is a case study in consensus and fault-injection
-testing, not a production service: the log is never compacted, membership is
-fixed, and no money moves outside the ledger.
+every event, plus six more for the play commands of game clients. The
+repository is a case study in consensus and fault-injection testing, not a
+production service: the log is never compacted, membership is fixed, and no
+money moves outside the ledger.
 
 Contents: [The problem](#the-problem) |
 [Why consensus](#why-consensus-rather-than-a-single-database) |
@@ -146,7 +147,7 @@ and `tournament` (for `game`, `ledger` and `tournament`), which inspect `go list
   internal/game        milestone 4: Ladder card puzzle rules, seeded deals, moves, scores
   internal/session     milestone 4: HMAC session tokens, keyrings, device verifiers
   internal/intent      milestone 4: the play API for game clients (sessions, intents, events)
-  internal/sim         virtual clock, event heap, fault schedule, clients, scenarios, Checker
+  internal/sim         virtual clock, event heap, fault schedule, operator and play clients, scenarios, Checker
   cmd/arena            the service; cmd/chaos: the simulator's command line
 
   paxos  <- ledger     <- tournament <- replica <- api <- cmd/arena
@@ -157,6 +158,7 @@ and `tournament` (for `game`, `ledger` and `tournament`), which inspect `go list
   jsonx  <- replog, replog/wal, tournament, api
   game   <- tournament
   game, ledger, paxos, replica, replog, session, tournament <- intent <- cmd/arena
+  game, intent, session <- sim
 ```
 
 `paxos`, `replog`, `tournament`, `ledger` and `replica.Core` contain no
@@ -469,7 +471,7 @@ random    1     203073  62         67       104         664      6911  2530     
 
 invariant  checks  result  description
 S1         155689  ok      single chosen value per slot
-S2         268598  ok      identical applied sequences and state hashes
+S2         268603  ok      identical applied sequences and state hashes
 S3         218212  ok      acceptor promise monotone; accepts at or above the promise
 S4         180067  ok      ballots unique per node; one value per (ballot, slot)
 S5         67      ok      durable state survives a crash; torn writes keep the old record
@@ -491,39 +493,51 @@ of which 13 900 were dropped and 6 225 duplicated, 664 tournaments settled
 and every invariant evaluated between 67 and 293 851 times without a
 violation.
 
-Every scripted scenario, ten seeds each (4.5 s wall time):
+Every scripted scenario, ten seeds each (6.7 s wall time for the built
+binary):
 
 ```
 $ go run ./cmd/chaos -scenario all -seeds 10 -log-level warn
-seed=1 scenario="leader_crash_mid_settlement" nodes=5 lease=true steps=20000 ... crashes=1 ... settled=1 ... client.settled=1
-...   (90 report lines)
+seed=1 scenario="leader_crash_mid_settlement" nodes=5 lease=true steps=20000 sim_time=21.712971121s elections=2 leader_changes=8 crashes=1 torn_writes=0 partitions=0 ...
+...   (140 report lines)
 
-scenario                           runs  steps   elections  crashes  partitions  settled  keys   replays  key_reused  result
-leader_crash_mid_settlement        10    200000  20         10       0           10       2030   0        0           ok
-dueling_leaders                    10    89403   78         0        68          354      3685   79       0           ok
-partition_and_heal                 10    90244   41         0        39          272      2840   25       0           ok
-duplicated_and_reordered_messages  10    74912   35         0        0           60       631    609      0           ok
-client_retry_storm                 10    77991   15         10       12          124      1297   12773    5593        ok
-crash_restart_storm                10    66025   76         192      14          326      3394   489      0           ok
-clock_skew                         10    69545   28         9        21          310      3213   43       0           ok
-late_learner                       10    294534  10         0        0           712      12691  0        0           ok
-exclusion_change_at_settle         10    65259   33         11       41          402      4020   83       0           ok
+scenario                               runs  steps   elections  crashes  partitions  settled  keys   replays  key_reused  result
+leader_crash_mid_settlement            10    200000  20         10       0           10       2030   0        0           ok
+dueling_leaders                        10    89403   78         0        68          354      3685   79       0           ok
+partition_and_heal                     10    90244   41         0        39          272      2840   25       0           ok
+duplicated_and_reordered_messages      10    74912   35         0        0           60       631    609      0           ok
+client_retry_storm                     10    77991   15         10       12          124      1297   12773    5593        ok
+crash_restart_storm                    10    66025   76         192      14          326      3394   489      0           ok
+clock_skew                             10    69545   28         9        21          310      3213   43       0           ok
+late_learner                           10    294534  10         0        0           712      12691  0        0           ok
+exclusion_change_at_settle             10    65259   33         11       41          402      4020   83       0           ok
+duplicate_intents_after_leader_change  10    131761  50         40       0           161      5546   4070     0           ok
+stale_sequence_replay                  10    112637  55         15       126         107      4409   1831     0           ok
+partition_during_payout_claim          10    130498  74         0        40          159      5506   8        0           ok
+token_expiry_mid_round                 10    300000  30         20       0           20       494    0        0           ok
+deal_during_leader_change              10    107792  50         40       0           148      4883   23       0           ok
 
 invariant  checks   result  description
-S1         829211   ok      single chosen value per slot
-S2         230897   ok      identical applied sequences and state hashes
-S3         1079483  ok      acceptor promise monotone; accepts at or above the promise
-S4         838910   ok      ballots unique per node; one value per (ballot, slot)
-S5         232      ok      durable state survives a crash; torn writes keep the old record
-S6         39713    ok      a slot chosen after a higher slot is a no-op
-S7         21520    ok      consistent reads reflect every command completed before them
-S8         330495   ok      at most one non-replayed result per idempotency key
-D1         79887    ok      prize pool equals entry fees minus rake; pool account nets to zero
-D2         231440   ok      every payout appears exactly once, sums to the pool
-D3         33010    ok      a settled tournament never changes
-D4         46877    ok      standings are a function of the scores and the tie-break rule
-D5         231440   ok      eligibility checked and its list version recorded at entry and payout
-D6         189152   ok      money never appears or disappears
+S1         1142436  ok      single chosen value per slot
+S2         345423   ok      identical applied sequences and state hashes
+S3         1807723  ok      acceptor promise monotone; accepts at or above the promise
+S4         1359560  ok      ballots unique per node; one value per (ballot, slot)
+S5         347      ok      durable state survives a crash; torn writes keep the old record
+S6         62024    ok      a slot chosen after a higher slot is a no-op
+S7         38986    ok      consistent reads reflect every command completed before them
+S8         497833   ok      at most one non-replayed result per idempotency key
+D1         111323   ok      prize pool equals entry fees minus rake; pool account nets to zero
+D2         330924   ok      every payout appears exactly once, sums to the pool
+D3         47500    ok      a settled tournament never changes
+D4         63823    ok      standings are a function of the scores and the tie-break rule
+D5         330924   ok      eligibility checked and its list version recorded at entry and payout
+D6         279482   ok      money never appears or disappears
+P1         14914    ok      no double claim: one claim posting per player, only when settled, for the payouts not withheld
+P2         69719    ok      sequence numbers consumed 1, 2, 3 per player; stale and skipped numbers change nothing
+P3         16154    ok      no card shown before its deal is chosen; no stock card before its draw; seed only when finished
+P4         80137    ok      scores are computed by the server: moves replay legally, scores match the replay
+P5         66709    ok      every deal seed is the one the deal secret derives
+P6         118665   ok      no move accepted past its deadline; the state clock never decreases
 ```
 
 In `client_retry_storm` the clients re-sent 80% of their completed commands
@@ -538,6 +552,102 @@ all 142 tournaments of the three runs. A failing seed is replayed with the
 printed command; `-trace FILE` writes the event trace, and two runs of one
 seed produce byte-identical traces (`sim.TestReplayDeterministic`).
 
+The five play scenarios run play clients through a model of the play API
+(section 12 of [`docs/UNITY-INTEGRATION.md`](docs/UNITY-INTEGRATION.md)).
+Over the fifty runs above they settled 595 tournaments and claimed 1 202
+payouts. In `duplicate_intents_after_leader_change` 40 leaders were
+crashed right after proposing a move or a claim (22 of them with their
+outgoing messages lost), clients resent 1 120 completed intents with their
+keys, and the 4 070 replays and 329 second claims under new keys
+(`already_claimed`) left one claim posting per player. `stale_sequence_replay`
+sent 422 captured intents under new keys, 405 with skipped numbers and 386
+under their own keys across 126 partitions; every one was answered
+`stale_seq`, `seq_gap` or with its recorded result, and P2 found no state
+change beyond the results table. `partition_during_payout_claim` cut 40
+leaders off while a claim was in flight; no replica on the minority side
+committed a slot that the majority had not accepted before the cut (twice
+it committed one that the majority had). In `token_expiry_mid_round` 20
+apps were suspended mid-round for more than the 2 s token lifetime plus the
+30 s leeway while 20 leaders crashed; 31 resent intents were refused
+`session_expired`, the 20 replayed session requests carried expired tokens,
+and after a new session every stored move was applied with its original
+key and number. Across all five, 1 331 illegal moves were rejected and P3
+checked 16 154 views, 4 914 of them read from random replicas.
+
+### `scripts/e2e.sh`: the client SDK against three processes
+
+`scripts/e2e.sh` (or `make e2e`) is the end-to-end test of the play API.
+It needs Go, `curl` and a .NET SDK, version 8 or later; without `dotnet` it
+prints a `SKIP` line and exits 0. It is not part of `make check` or CI. It
+builds `arena` and the C# SDK's harness (`unity-client/Tests~/Harness`),
+generates a session key and a deal secret into a temporary directory,
+starts three replicas as separate processes on `127.0.0.1` with `-wal` and
+`-play-listen` and 30-second session tokens, and runs the harness twice:
+
+1. The whole flow on a new `ladder-v1` tournament with three players:
+   sessions, join, three dealt rounds played to the end with every view,
+   commitment and revealed seed checked by an independent C#
+   implementation of the rules, one illegal move (`409 illegal_move`, its
+   number consumed, the board unchanged), finishes, a completed move resent
+   with its `Idempotency-Key` (status, `X-Arena-Slot`, `X-Arena-Next-Seq`
+   and body identical but for `replayed`), the same body under a new key
+   (`409 stale_seq`), sequence errors the SDK resynchronises from, a client
+   restarted with an intent in flight, leaderboard, operator close and
+   settle, events, claims, and the ledger read through the operator API:
+   exactly one claim posting per paid player.
+2. The same flow on another tournament, with the leader's process killed
+   (`SIGKILL`) in the middle of round 2 while a move it applied has not
+   been answered to the game. The client is rebuilt from its store,
+   resends the move with its key, gets no response from the dead leader,
+   follows a follower's `307` to the new leader and receives the recorded
+   result; the flow then finishes with exactly one claim per paid player.
+
+After each run every replica must report the same applied slot and state
+hash through `GET /v1/node`; before the second check the killed replica is
+restarted from its wal file. Every process started is stopped on exit, and
+the temporary directory is removed unless a step failed or `E2E_KEEP=1`.
+`E2E_PORT_BASE` (default 38080) moves the ports: operator `base+1..3`,
+play `base+11..13`; `E2E_SESSION_TTL` (default `30s`) sets `-session-ttl`,
+short enough that the SDK refreshes its tokens during each run. A run takes
+about 70 seconds. Trimmed output:
+
+```
+$ scripts/e2e.sh
+e2e: work directory $TMPDIR/paxos-arena-e2e.rO4xNG
+e2e: building arena
+e2e: building the client harness
+e2e: starting 3 replicas: operator http://127.0.0.1:38081,http://127.0.0.1:38082,http://127.0.0.1:38083, play http://127.0.0.1:38091,http://127.0.0.1:38092,http://127.0.0.1:38093, session tokens for 30s
+e2e: node 2 leads
+e2e: run1: dotnet PaxosArena.Client.Harness.dll --play $PLAY --operator $OP --players 3 
+...
+ok    3 player 0 round 1: play of column 1 at move 0 answered 409 illegal_move; seq 3 consumed, board unchanged
+...
+ok    4 resent the last move with its key (seq 142): status 200, X-Arena-Slot 349, body byte-identical but for replayed:true
+ok    4 the last move's body (seq 142) under a new key: 409 stale_seq, X-Arena-Next-Seq 144; resent with that key: the same 409
+ok    4 stale_seq answered 409 and the client resynchronised
+ok    4 seq_gap answered 409 and the client resynchronised
+...
+ok    8 ledger through the operator API: 3 entry fees, 3 prizes, exactly one claim posting for each of the 3 paid players, every posting key once
+ok    sessions answered 200: 15 for 3 players (two each in step 2; the rest refreshed a token before expiry or after a restart)
+PASS  live flow
+e2e: identical state on every replica: node 1 applied 463 hash 37ef29c45aa81d27... node 2 applied 463 hash 37ef29c45aa81d27... node 3 applied 463 hash 37ef29c45aa81d27...
+e2e: run2: dotnet PaxosArena.Client.Harness.dll --play $PLAY --operator $OP --players 3 --kill-leader-command $TMPDIR/paxos-arena-e2e.rO4xNG/kill-leader.sh
+...
+ok    3 running the kill-leader command
+ok    3 kill-leader command exited 0: killed node 2 (pid 20277) with SIGKILL
+ok    3 node at http://127.0.0.1:38081 leads after the kill
+ok    3 player 0 round 2: move 5 (seq 56, key 8950913e2a41b4e283fbce076a942945) applied, leader killed before the answer was delivered, client rebuilt from its store; resend: http://127.0.0.1:38092 no response -> http://127.0.0.1:38093 307 -> http://127.0.0.1:38091 200 replayed
+...
+ok    4 resent the last move with its key (seq 149): status 200, X-Arena-Slot 810, body byte-identical but for replayed:true
+...
+ok    8 ledger through the operator API: 3 entry fees, 3 prizes, exactly one claim posting for each of the 3 paid players, every posting key once
+...
+PASS  live flow
+e2e: restarting node 2 from $TMPDIR/paxos-arena-e2e.rO4xNG/node2.wal
+e2e: identical state on every replica: node 1 applied 938 hash 964bab4e9c203b0a... node 2 applied 938 hash 964bab4e9c203b0a... node 3 applied 938 hash 964bab4e9c203b0a...
+e2e: PASS
+```
+
 ## How it is tested
 
 Four layers, all under the race detector in CI.
@@ -551,9 +661,12 @@ Four layers, all under the race detector in CI.
    per-node clock offset and rate, crashes that land between commit and
    apply, torn writes, partitions including directional and non-transitive
    ones, clients that follow leader hints, retry with the same key and issue
-   consistent reads, and a `Checker` that evaluates S1-S8 and D1-D6 after
-   every event and replays the chosen log into a fresh state at the end.
-   `TestScenarios` runs the nine scenarios with 50 seeds each and
+   consistent reads, play clients that go through a model of the play API
+   (tokens checked at the leader's clock, seeds derived from a deal secret,
+   views built from applied state), and a `Checker` that evaluates S1-S8,
+   D1-D6 and, for play commands, P1-P6 after every event and replays the
+   chosen log into a fresh state at the end.
+   `TestScenarios` runs the fourteen scenarios with 50 seeds each and
    `TestRandom` 200 seeds of the random schedule (`-seeds` and
    `-random-seeds` raise them; `-short` lowers them to 5 and 20;
    `make sim-long` runs 1 000 and 2 000). `testdata/seeds.txt` is the corpus
@@ -562,7 +675,9 @@ Four layers, all under the race detector in CI.
 3. Goroutine-level tests: `replica.Runner` under `testing/synctest`, the
    HTTP transport and API on `httptest` servers, the file store against torn
    and corrupted files, and `TestThreeNodesOverHTTP` for the three-process
-   demo.
+   demo. Outside `go test`, `scripts/e2e.sh` runs the C# client SDK's
+   harness against three `arena` processes, once with the leader killed
+   mid-round ([below](#scriptse2esh-the-client-sdk-against-three-processes)).
 4. Adversarial tests written by reviewers, one file per package
    (`adversarial_test.go`, `*_review_test.go`): each attacks one guarantee
    (a chosen but unlearned value surviving a takeover, stale acceptances
@@ -582,6 +697,11 @@ planted bugs (`replog.UnsafeKnobs`: accept below the promise, ignore Phase 1
 reports, serve reads before the leadership no-op, forget accepted values on
 restart) one at a time and asserts that the checker reports the expected
 invariant (S3, S1, S7, S5) within a bounded number of seeds.
+`sim.TestPlayInvariantsCatchPlantedFaults` plants a view that shows an
+undrawn stock card, a finished round's view without its seed, views that
+predate the deal or the finish, a move applied with a used sequence number,
+a clock that goes back, a seed from another deal secret and a second claim
+posting, and requires P3, P2, P6, P5 and P1 respectively.
 
 Invariants and where each is checked:
 
@@ -601,6 +721,12 @@ Invariants and where each is checked:
 | D4 | Standings are a function of the scores and the tie-break rule | `tournament.TestStandingsTable` | recomputed on every closed tournament |
 | D5 | Eligibility checked and its list version recorded at entry and payout | `tournament.TestJoinEligibility`, `tournament.TestSettleWithholdsNewlyExcluded` | every apply; `exclusion_change_at_settle` |
 | D6 | Money never appears or disappears inside the book: balances sum to zero and equal the balances recomputed from the postings | `ledger.TestCheck` | `CheckBalances` after every apply and the full `Check` every 64 applies and at the end, on every node |
+| P1 | No double claim: at most one claim posting per (tournament, player), only in a settled tournament, for exactly the payouts not withheld | `tournament.TestClaimPayout`, `intent.TestClaimRoute` | every applied claim and settle of a play tournament, and at the end; `partition_during_payout_claim` |
+| P2 | Sequence numbers consumed 1, 2, 3 per player in slot order; `stale_seq`, `seq_gap` and `unknown_player` change nothing but the results table | `tournament.TestSequenceNumbers`, `tournament.TestEnterValidationOrder` | every applied sequenced command; `stale_sequence_replay` |
+| P3 | No card is shown before its deal is chosen in the log, no stock card before its draw, and the seed only once the round is finished as of the view | `intent.TestRoundThroughHandlers` | every view the simulated play API builds, and reads from random replicas; `deal_during_leader_change` |
+| P4 | Scores are the server's: accepted moves replay legally, finished rounds score what the replay scores, a scored entry is the sum of its rounds | `game.TestReplayMatchesApply`, `tournament.TestCloseFinishesRoundsAndScoresEntries` | every applied round command and close, and at the end |
+| P5 | Every deal seed is the HMAC the deal secret derives for (tournament, player, round) | `game.TestAppendixVectors` | every applied deal and every round at the end |
+| P6 | No move accepted past its deadline; the state machine's clock never decreases | `tournament.TestPlayMove`, `tournament.TestPlayLogReplaysIdentically` | every applied play command |
 
 Liveness is not an invariant (no protocol guarantees it under unbounded
 faults). `sim.TestLivenessAfterHeal` runs the fault schedule, heals
@@ -623,6 +749,11 @@ The scenarios (`docs/DESIGN.md` section 7 gives the schedules):
 | `clock_skew` | per-node clock offset and rate in [0.5, 2] with the lease on | S1-S8 hold; skew costs only liveness |
 | `late_learner` | one follower loses every `Learn` for 500 slots, then reconnects | catch-up through `LearnRequest`; S2; commit index monotone |
 | `exclusion_change_at_settle` | list version 7 at creation, version 8 at settle adds an entrant's jurisdiction | D5: that payout is withheld with version 8; D2: totals unchanged |
+| `duplicate_intents_after_leader_change` | play clients; the leader is crashed right after it proposes a move or a claim, half the time with its outgoing messages lost; clients retry the key through the new leader and resend completed deals, moves and claims with their keys | S8, P1, P2: one application per key, replays identical, one claim per player; a second claim under a new key is `already_claimed` |
+| `stale_sequence_replay` | play clients; before each intent a player may replay a captured earlier one under a new key (used number), with a number skipped ahead, or under its own key, while partitions come and go | P2: `stale_seq`, `seq_gap` and the recorded result, no state change beyond the results table |
+| `partition_during_payout_claim` | play clients; the leader that proposes a claim is cut off from the majority (with one follower of five), messages in flight across the cut are dropped, clients retry every attempt on another node, heal after 300-1200 ms | P1, D6: one claim each; no replica on the minority side commits a slot no majority acceptor had accepted |
+| `token_expiry_mid_round` | play clients with 2 s tokens; a player's app is suspended mid-round for longer than a token lives (plus the 30 s leeway), with a move stored and a session request in flight, and the leader crashes meanwhile | the move is refused `session_expired`, the replayed session carries an expired token, a new session follows, the move is applied with its key and number (P2) |
+| `deal_during_leader_change` | play clients; the leader is crashed right after it proposes a `StartRound` | P3, P5: no view before the deal is applied; the retry deals the same seed |
 
 The full run, on go1.27.1, darwin/arm64:
 
@@ -634,24 +765,28 @@ $ go vet ./...
 $ go mod tidy -diff
 
 $ go test -race -count=1 ./...
-ok  	github.com/oguzhanozfe/paxos-arena/cmd/arena	2.650s
-ok  	github.com/oguzhanozfe/paxos-arena/cmd/chaos	10.441s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/api	2.137s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/jsonx	1.845s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/ledger	2.636s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/paxos	3.877s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/replica	5.186s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/replog	38.146s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/replog/wal	3.651s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/sim	106.956s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/tournament	4.356s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/transport	6.576s
+ok  	github.com/oguzhanozfe/paxos-arena/cmd/arena	6.082s
+ok  	github.com/oguzhanozfe/paxos-arena/cmd/chaos	14.865s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/api	2.507s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/game	2.471s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/intent	4.023s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/jsonx	3.064s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/ledger	2.519s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/paxos	4.259s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/replica	6.591s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/replog	42.061s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/replog/wal	4.294s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/session	4.111s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/sim	141.804s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/tournament	25.556s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/transport	7.744s
 ```
 
-That is 1 min 48 s of wall time on 18 cores; the reviewers' adversarial
-tests account for most of the `replog` time. The same suite passes with
-`-shuffle=on`; without `-race` it takes about 13 s. Under `-race`,
-`internal/sim` needs close to two minutes per `-count`, so raising `-count`
+That is 2 min 22 s of wall time on 18 cores; the reviewers' adversarial
+tests account for most of the `replog` time, and the fourteen scenarios at 50
+seeds each for most of `internal/sim`. The same suite passes with
+`-shuffle=on`; without `-race` it takes about 17 s. Under `-race`,
+`internal/sim` needs close to two and a half minutes per `-count`, so raising `-count`
 needs a `-timeout` above Go's default of ten minutes, as `make race` and CI
 pass. `make check` runs gofmt, vet, build, `go mod tidy -diff` and the
 race run, which is what [`.github/workflows/go.yml`](.github/workflows/go.yml)
@@ -740,12 +875,14 @@ Each item is a boundary of the system as built, not an oversight.
   acceptor accepted above the candidate's commit index in one message; a
   candidate lagging by more than the 16 MiB message limit cannot collect
   promises over HTTP until it has caught up through a leader.
-- The game. No rules engine, no deal generation beyond a 64-bit seed, no
-  replay validation of input logs, no anomaly detection; `input_digest` is
-  stored, not checked. Milestone 4 specifies server-authoritative play, with
-  a card puzzle whose every move and score the state machine decides, in
-  [`docs/UNITY-INTEGRATION.md`](docs/UNITY-INTEGRATION.md); only its Go types
-  exist so far.
+- Validation of client-reported scores. A tournament created without a
+  `game` takes scores through `SubmitScore`; there is no replay of input
+  logs and no anomaly detection, and `input_digest` is stored, not checked.
+  A `ladder-v1` tournament takes no score input: the state machine deals
+  from a seed committed to the log and decides every move and score
+  ([`docs/UNITY-INTEGRATION.md`](docs/UNITY-INTEGRATION.md)). The C# SDK has
+  been compiled against stubs and run against the cluster from `dotnet`, not
+  built in the Unity editor.
 - Lease-based reads, display leaderboards, matchmaking, ratings, tax
   reporting, multiple fund types.
 - Byzantine faults. Replicas crash, restart, partition and see delayed,
@@ -762,7 +899,7 @@ Each item is a boundary of the system as built, not an oversight.
   testing, no tuning of `Window` or timeouts beyond what makes the simulation
   and the demo work. Applying a command runs on the replica's event loop, so
   a large command delays heartbeats; the 64 KiB body limit keeps that well
-  under an election timeout. `internal/sim` takes about 110 s under
+  under an election timeout. `internal/sim` takes about 140 s under
   `-race`.
 
 ## Further work
@@ -828,7 +965,7 @@ paxos-arena/
   go.mod                        module github.com/oguzhanozfe/paxos-arena, go 1.26.0, no dependencies
   README.md                     this file
   LICENSE                       MIT
-  Makefile                      build, test, race, lint, check, sim-long, fuzz
+  Makefile                      build, test, race, lint, check, sim-long, fuzz, e2e
   .github/workflows/go.yml      gofmt, vet, build, tidy -diff, test -race on Go 1.26.x and 1.27.x
   cmd/arena/                    the service: N replicas in one process, or one per process with a wal file
   cmd/chaos/                    the simulator's command line
@@ -844,8 +981,9 @@ paxos-arena/
   internal/game/                milestone 4: card puzzle rules, deals, scores
   internal/session/             milestone 4: session tokens and device verifiers
   internal/intent/              milestone 4: the play API served by arena -play-listen
-  internal/sim/                 deterministic simulation and invariant checker
-  unity-client/                 milestone 4: C# client SDK layout (README only so far)
+  internal/sim/                 deterministic simulation, play workload and invariant checker
+  unity-client/                 milestone 4: C# client SDK, its harness and compile checks
+  scripts/e2e.sh                the SDK harness against three arena processes, with a leader kill
   docs/DESIGN.md                the specification
   docs/UNITY-INTEGRATION.md     milestone 4 contract: server-authoritative play from a game client
   docs/adr/                     decisions taken during implementation
