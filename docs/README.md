@@ -16,6 +16,21 @@ the nine chaos scenarios, milestones and non-goals. Written before the
 implementation; where the implementation deviates, an ADR records it and
 the ADR takes precedence over the affected paragraph.
 
+## `UNITY-INTEGRATION.md`
+
+The contract for milestone 4, server-authoritative play from a mobile game
+client built with the Unity engine, written so that the Go server and the
+C# client can be built in parallel: the trust model; device-bound sessions
+with HMAC-SHA256 tokens and key rotation; idempotency keys and per-player
+sequence numbers; Ladder, the single-player card puzzle the tournaments
+play, with its deal committed to the log before any card is shown; the six
+play commands and their validation order; every route with its JSON bodies,
+status codes, error body, leader redirect and rate limits; the JSON rules a
+`JsonUtility` client needs; the client's caching, resend, backoff, clock and
+election rules; the Go functions and flags to build; the C# SDK layout; new
+invariants and chaos scenarios; and test vectors. So far only the Go types
+and `unity-client/README.md` exist.
+
 ## `adr/`
 
 One short record per decision that was taken or changed while implementing
