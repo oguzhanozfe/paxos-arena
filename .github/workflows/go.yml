@@ -20,6 +20,9 @@ env:
 jobs:
   check:
     name: go ${{ matrix.go }}
+    # Runs only once the repository is public, so a private repository
+    # spends no Actions minutes.
+    if: ${{ !github.event.repository.private }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
