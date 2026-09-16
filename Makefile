@@ -4,7 +4,7 @@
 GO ?= go
 BIN ?= bin
 
-.PHONY: all build test race lint tidy check sim-long fuzz clean
+.PHONY: all build test race lint tidy check sim-long fuzz e2e clean
 
 all: check
 
@@ -15,12 +15,12 @@ build:
 	$(GO) build -o $(BIN)/arena ./cmd/arena
 	$(GO) build -o $(BIN)/chaos ./cmd/chaos
 
-## test: run the tests once, without the race detector (about 15 s).
+## test: run the tests once, without the race detector (about 17 s).
 test:
 	$(GO) test -count=1 ./...
 
-## race: run the tests once under the race detector, in shuffled order (about 2 min).
-## internal/sim alone takes close to 2 min per -count under -race, so keep an
+## race: run the tests once under the race detector, in shuffled order (about 2.5 min).
+## internal/sim alone takes close to 2.5 min per -count under -race, so keep an
 ## explicit -timeout above 10m when raising -count.
 race:
 	$(GO) test -race -count=1 -shuffle=on -timeout 15m ./...
@@ -47,6 +47,12 @@ fuzz:
 	$(GO) test -run=NONE -fuzz=FuzzDecode -fuzztime=30s ./internal/replog
 	$(GO) test -run=NONE -fuzz=FuzzDecode -fuzztime=30s ./internal/tournament
 	$(GO) test -run=NONE -fuzz=FuzzSeed -fuzztime=30s ./internal/sim
+
+## e2e: the client SDK's harness against three arena processes, once with the
+## leader killed mid-round (needs curl and a .NET SDK; skips without dotnet).
+## Not part of check or CI.
+e2e:
+	scripts/e2e.sh
 
 clean:
 	rm -rf $(BIN) arena chaos
