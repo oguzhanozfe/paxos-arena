@@ -16,8 +16,11 @@ type record struct {
 }
 
 // State is the replicated tournament state: every tournament record, the
-// results table keyed by idempotency key, and the ledger. Apply feeds it
-// chosen log entries in slot order. It is not safe for concurrent use.
+// results table keyed by idempotency key, the ledger, and the play state of
+// docs/UNITY-INTEGRATION.md section 6: device bindings, player records,
+// round records, the event records and the state machine's clock. Apply
+// feeds it chosen log entries in slot order. It is not safe for concurrent
+// use.
 type State struct {
 	tournaments map[TournamentID]*Tournament
 	order       []TournamentID
@@ -27,12 +30,18 @@ type State struct {
 	hash        [32]byte
 	commands    int
 	mutations   uint64
+
+	play playState
+	// clock is the largest ReceivedAt of every command applied so far.
+	clock int64
 }
 
-// Mutations returns the number of applied commands that changed a
-// tournament record or the ledger: successful, non-replayed commands. A
-// checker uses it to prove that a replay, a rejection or a key_reused
-// answer changed nothing.
+// Mutations returns the number of successful, non-replayed commands: the
+// commands that may change a tournament record, the ledger or the play
+// state. A checker uses it to prove that a replay, a rejection or a
+// key_reused answer changed nothing; the one exception is a rule rejection
+// of a sequenced play command, which also consumes the player's sequence
+// number (docs/UNITY-INTEGRATION.md section 3.2).
 func (s *State) Mutations() uint64 { return s.mutations }
 
 // Recorded returns the number of keys in the results table.
@@ -44,6 +53,7 @@ func NewState() *State {
 		tournaments: make(map[TournamentID]*Tournament),
 		results:     make(map[IdempotencyKey]record),
 		book:        ledger.NewBook(),
+		play:        newPlayState(),
 	}
 }
 
@@ -56,9 +66,11 @@ func (s *State) Commands() int { return s.commands }
 
 // Hash returns a digest that identifies the applied prefix: a chain over
 // the canonical encoding of every applied slot's command, result, affected
-// tournament record and new postings, and over every skipped slot. Two
-// states with the same applied prefix have the same hash; a fresh state
-// that replays the same log reproduces it.
+// tournament record and new postings, the bindings, player records and
+// round records the command changed and the events it recorded, and over
+// every skipped slot. Two states with the same applied prefix have the same
+// hash; a fresh state that replays the same log reproduces it. A slot that
+// touches no play state mixes in exactly what earlier versions did.
 func (s *State) Hash() [32]byte { return s.hash }
 
 // Tournament returns a deep copy of the record with id.
@@ -133,7 +145,11 @@ func (s *State) Apply(slot paxos.Slot, ballot paxos.Ballot, cmd Command) Result 
 	}
 	s.applied = slot
 	s.commands++
+	if cmd.ReceivedAt > s.clock {
+		s.clock = cmd.ReceivedAt
+	}
 	before := s.book.Len()
+	s.play.begin()
 	res := s.execute(slot, ballot, cmd)
 	s.mix(slot, ballot, cmd, res, before)
 	return res
@@ -165,6 +181,18 @@ func (s *State) execute(slot paxos.Slot, ballot paxos.Ballot, cmd Command) Resul
 		res = s.close(slot, op)
 	case Settle:
 		res = s.settle(slot, ballot, op)
+	case OpenSession:
+		res = s.openSession(slot, cmd.ReceivedAt, op)
+	case Enter:
+		res = s.enterPlay(slot, ballot, op)
+	case StartRound:
+		res = s.startRound(slot, op)
+	case PlayMove:
+		res = s.playMove(slot, op)
+	case FinishRound:
+		res = s.finishRoundCmd(slot, op)
+	case ClaimPayout:
+		res = s.claimPayout(slot, ballot, op)
 	default:
 		return Result{Code: InvalidOp, Detail: fmt.Sprintf("unknown op %T", cmd.Op), Slot: slot}
 	}
@@ -203,6 +231,20 @@ func (s *State) join(slot paxos.Slot, ballot paxos.Ballot, op Join) Result {
 	if !ok {
 		return reject(UnknownTournament, fmt.Sprintf("no tournament %q", op.Tournament))
 	}
+	if t.Rules.Game != "" {
+		return reject(PlayIntentRequired, fmt.Sprintf("tournament %q plays %s: entries come from play intents", t.ID, t.Rules.Game))
+	}
+	res := s.admit(slot, ballot, t, op.Player)
+	if res.Code == OK {
+		res.Seed = t.Seed
+	}
+	return res
+}
+
+// admit runs the entry rules shared by Join and Enter, from not_open on,
+// and on success enters player and posts the fee.
+func (s *State) admit(slot paxos.Slot, ballot paxos.Ballot, t *Tournament, player Player) Result {
+	op := Join{Tournament: t.ID, Player: player}
 	if t.Status != Open {
 		return reject(NotOpen, fmt.Sprintf("tournament %q is %s", t.ID, t.Status))
 	}
@@ -242,13 +284,16 @@ func (s *State) join(slot paxos.Slot, ballot paxos.Ballot, op Join) Result {
 		Player: op.Player, JoinSeq: uint32(len(t.Entries) + 1),
 		ExclusionVersion: t.Rules.Exclusions.Version,
 	})
-	return Result{Code: OK, Seed: t.Seed}
+	return Result{Code: OK}
 }
 
 func (s *State) score(op SubmitScore) Result {
 	t, ok := s.tournaments[op.Tournament]
 	if !ok {
 		return reject(UnknownTournament, fmt.Sprintf("no tournament %q", op.Tournament))
+	}
+	if t.Rules.Game != "" {
+		return reject(PlayIntentRequired, fmt.Sprintf("tournament %q plays %s: scores come from the rounds played", t.ID, t.Rules.Game))
 	}
 	if t.Status != Open {
 		return reject(NotOpen, fmt.Sprintf("tournament %q is %s", t.ID, t.Status))
@@ -288,6 +333,9 @@ func (s *State) close(slot paxos.Slot, op Close) Result {
 	if t.Status != Open {
 		return reject(NotOpen, fmt.Sprintf("tournament %q is %s", t.ID, t.Status))
 	}
+	if t.Rules.Game != "" {
+		s.closeRounds(slot, t)
+	}
 	t.Standings = ComputeStandings(t)
 	t.Fees, t.Rake, t.Pool = ComputePool(t)
 	t.ClosedAt = slot
@@ -295,6 +343,9 @@ func (s *State) close(slot paxos.Slot, op Close) Result {
 		t.Status = Voided
 	} else {
 		t.Status = Closed
+	}
+	if t.Rules.Game != "" {
+		s.recordStatus(slot, t)
 	}
 	return Result{Code: OK}
 }
@@ -363,6 +414,14 @@ func (s *State) settle(slot paxos.Slot, ballot paxos.Ballot, op Settle) Result {
 	t.Status = Settled
 	t.SettledAt = slot
 	t.Ballot = ballot
+	if t.Rules.Game != "" {
+		s.recordStatus(slot, t)
+		for _, p := range payouts {
+			if !p.Withheld && p.Amount > 0 {
+				s.recordEvent(EventRecord{Slot: slot, Type: EventPayoutAvailable, Tournament: t.ID, Player: p.Player, Amount: p.Amount})
+			}
+		}
+	}
 	return Result{Code: OK}
 }
 
@@ -402,6 +461,7 @@ func (s *State) mix(slot paxos.Slot, ballot paxos.Ballot, cmd Command, res Resul
 		h.Write([]byte{'\n'})
 	}
 	h.Write(EncodePostings(s.book.PostingsSince(postingsBefore)))
+	s.mixPlay(func(b []byte) { h.Write(b) })
 	copy(s.hash[:], h.Sum(nil))
 }
 

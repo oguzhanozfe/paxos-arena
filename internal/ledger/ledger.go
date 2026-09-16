@@ -23,9 +23,9 @@ import (
 // money.
 type Money int64
 
-// Account names one balance. The four shapes used by the tournament state
-// machine are built by PlayerAccount, PoolAccount, RakeAccount and
-// WithheldAccount.
+// Account names one balance. The shapes used by the tournament state
+// machine are built by PlayerAccount, PoolAccount, RakeAccount,
+// WithheldAccount and ClaimsAccount.
 type Account string
 
 // PostingKey is the idempotency key of one posting.
@@ -46,6 +46,9 @@ const (
 	Withheld
 	// Refund returns an entry fee from the pool to a player.
 	Refund
+	// Claim moves a player's settled payout from the player's account to
+	// the tournament's claims account, once, when the player claims it.
+	Claim
 )
 
 var kindNames = map[Kind]string{
@@ -54,6 +57,7 @@ var kindNames = map[Kind]string{
 	Prize:    "prize",
 	Withheld: "withheld",
 	Refund:   "refund",
+	Claim:    "claim",
 }
 
 // String returns the lower-case kind name.
@@ -332,6 +336,10 @@ func RakeAccount(tid string) Account { return Account("rake:" + tid) }
 // that could not be paid to their winner.
 func WithheldAccount(tid string) Account { return Account("withheld:" + tid) }
 
+// ClaimsAccount returns the account that receives the claimed payouts of
+// tournament tid: "claims:<tid>".
+func ClaimsAccount(tid string) Account { return Account("claims:" + tid) }
+
 // FeeKey returns the entry-fee posting key "fee:<tid>:<pid>".
 func FeeKey(tid, pid string) PostingKey { return PostingKey("fee:" + tid + ":" + pid) }
 
@@ -351,3 +359,6 @@ func WithheldKey(tid, pid string, place int) PostingKey {
 
 // RefundKey returns the refund posting key "refund:<tid>:<pid>".
 func RefundKey(tid, pid string) PostingKey { return PostingKey("refund:" + tid + ":" + pid) }
+
+// ClaimKey returns the claim posting key "claim:<tid>:<pid>".
+func ClaimKey(tid, pid string) PostingKey { return PostingKey("claim:" + tid + ":" + pid) }

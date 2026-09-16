@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/oguzhanozfe/paxos-arena/internal/game"
 	"github.com/oguzhanozfe/paxos-arena/internal/jsonx"
 )
 
@@ -44,6 +45,13 @@ const (
 	opScore  = "submit_score"
 	opClose  = "close"
 	opSettle = "settle"
+
+	opOpenSession = "open_session"
+	opEnter       = "enter"
+	opStartRound  = "start_round"
+	opPlayMove    = "play_move"
+	opFinishRound = "finish_round"
+	opClaimPayout = "claim_payout"
 )
 
 // OpName returns the wire name of a command's operation, or "" for an
@@ -60,12 +68,24 @@ func OpName(op Op) string {
 		return opClose
 	case Settle:
 		return opSettle
+	case OpenSession:
+		return opOpenSession
+	case Enter:
+		return opEnter
+	case StartRound:
+		return opStartRound
+	case PlayMove:
+		return opPlayMove
+	case FinishRound:
+		return opFinishRound
+	case ClaimPayout:
+		return opClaimPayout
 	}
 	return ""
 }
 
 // TournamentOf returns the tournament a command addresses; for
-// CreateTournament that is the new ID.
+// CreateTournament that is the new ID, and for OpenSession it is empty.
 func TournamentOf(op Op) TournamentID {
 	switch o := op.(type) {
 	case CreateTournament:
@@ -77,6 +97,16 @@ func TournamentOf(op Op) TournamentID {
 	case Close:
 		return o.Tournament
 	case Settle:
+		return o.Tournament
+	case Enter:
+		return o.Tournament
+	case StartRound:
+		return o.Tournament
+	case PlayMove:
+		return o.Tournament
+	case FinishRound:
+		return o.Tournament
+	case ClaimPayout:
 		return o.Tournament
 	}
 	return ""
@@ -170,6 +200,30 @@ func Decode(b []byte) (Command, error) {
 		var o Settle
 		err = strictUnmarshal(w.Body, &o)
 		c.Op = o
+	case opOpenSession:
+		var o OpenSession
+		err = strictUnmarshal(w.Body, &o)
+		c.Op = o
+	case opEnter:
+		var o Enter
+		err = strictUnmarshal(w.Body, &o)
+		c.Op = o
+	case opStartRound:
+		var o StartRound
+		err = strictUnmarshal(w.Body, &o)
+		c.Op = o
+	case opPlayMove:
+		var o PlayMove
+		err = strictUnmarshal(w.Body, &o)
+		c.Op = o
+	case opFinishRound:
+		var o FinishRound
+		err = strictUnmarshal(w.Body, &o)
+		c.Op = o
+	case opClaimPayout:
+		var o ClaimPayout
+		err = strictUnmarshal(w.Body, &o)
+		c.Op = o
 	default:
 		return Command{}, fmt.Errorf("tournament: decode command: unknown op %q", w.Op)
 	}
@@ -198,13 +252,21 @@ func mustMarshal(v any) []byte {
 }
 
 // Fingerprint covers the client-supplied part of a command: the op name and
-// the canonical payload, excluding Key, ReceivedAt and
-// CreateTournament.Seed. Two commands with equal fingerprints are the same
-// request from the state machine's point of view.
+// the canonical payload, excluding Key, ReceivedAt and the values a server
+// draws: CreateTournament.Seed, OpenSession.Player and StartRound.Seed.
+// Two commands with equal fingerprints are the same request from the state
+// machine's point of view.
 func Fingerprint(c Command) [32]byte {
 	op := Canonical(c.Op)
-	if o, ok := op.(CreateTournament); ok {
+	switch o := op.(type) {
+	case CreateTournament:
 		o.Seed = 0
+		op = o
+	case OpenSession:
+		o.Player = ""
+		op = o
+	case StartRound:
+		o.Seed = game.Seed{}
 		op = o
 	}
 	h := sha256.New()
@@ -369,5 +431,17 @@ func ValidateRules(r Rules) error {
 	if r.TieBreak != EarliestSubmission && r.TieBreak != Split {
 		return fmt.Errorf("tie_break %q is not %q or %q", r.TieBreak, EarliestSubmission, Split)
 	}
-	return ValidateExclusions(r.Exclusions)
+	if err := ValidateExclusions(r.Exclusions); err != nil {
+		return err
+	}
+	switch r.Game {
+	case "":
+	case game.LadderV1:
+		if r.MaxScore != game.MaxTotalScore {
+			return fmt.Errorf("max_score %d must be %d for game %q", r.MaxScore, game.MaxTotalScore, r.Game)
+		}
+	default:
+		return fmt.Errorf("game %q is not %q", r.Game, game.LadderV1)
+	}
+	return nil
 }

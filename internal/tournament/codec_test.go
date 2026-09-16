@@ -227,7 +227,7 @@ func TestTournamentOfAndOpName(t *testing.T) {
 // FuzzDecode: Decode never panics, and whatever it accepts re-encodes to
 // bytes that decode to the same command.
 func FuzzDecode(f *testing.F) {
-	for _, c := range corpus() {
+	for _, c := range append(corpus(), playCorpus()...) {
 		enc, _ := Encode(c)
 		f.Add(enc)
 	}

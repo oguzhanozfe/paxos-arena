@@ -275,6 +275,9 @@ func TestAccountAndKeyShapes(t *testing.T) {
 		string(PrizeKey("t1", "p1", 2)):    "prize:t1:p1:2",
 		string(WithheldKey("t1", "p1", 3)): "withheld:t1:p1:3",
 		string(RefundKey("t1", "p1")):      "refund:t1:p1",
+		string(ClaimsAccount("t1")):        "claims:t1",
+		string(ClaimKey("t1", "p1")):       "claim:t1:p1",
+		Claim.String():                     "claim",
 	}
 	for got, want := range cases {
 		if got != want {

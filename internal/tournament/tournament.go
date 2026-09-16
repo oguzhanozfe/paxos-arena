@@ -13,6 +13,7 @@ package tournament
 import (
 	"fmt"
 
+	"github.com/oguzhanozfe/paxos-arena/internal/game"
 	"github.com/oguzhanozfe/paxos-arena/internal/ledger"
 	"github.com/oguzhanozfe/paxos-arena/internal/paxos"
 )
@@ -140,6 +141,12 @@ type Rules struct {
 	TieBreak TieBreak `json:"tie_break"`
 	// Exclusions is the list checked at entry.
 	Exclusions Exclusions `json:"exclusions"`
+	// Game is empty for a tournament that takes client-reported scores
+	// through Join and SubmitScore, or game.LadderV1 for a tournament whose
+	// entries, rounds and scores come only from play commands
+	// (docs/UNITY-INTEGRATION.md section 6). A Ladder v1 tournament declares
+	// MaxScore game.MaxTotalScore.
+	Game game.Name `json:"game,omitempty"`
 }
 
 // Command is one client command with its idempotency key.
@@ -149,11 +156,13 @@ type Command struct {
 	// ReceivedAt is the leader's receipt time in Unix milliseconds. It is
 	// audit information and takes no part in validation or fingerprints.
 	ReceivedAt int64
-	// Op is one of CreateTournament, Join, SubmitScore, Close and Settle.
+	// Op is one of CreateTournament, Join, SubmitScore, Close and Settle,
+	// or one of the play commands OpenSession, Enter, StartRound, PlayMove,
+	// FinishRound and ClaimPayout.
 	Op Op
 }
 
-// Op is one of the five command payloads.
+// Op is one of the command payloads.
 type Op interface{ op() }
 
 // CreateTournament opens a tournament with rules and a deal seed.
@@ -282,6 +291,13 @@ type Result struct {
 	Slot paxos.Slot `json:"slot"`
 	// Seed is the deal to play; set for OK Join results.
 	Seed uint64 `json:"seed,omitempty"`
+	// Play is what a play command produced, from which the play API
+	// rebuilds its response; zero, and absent from the encoding, for every
+	// other command, so their encodings and state hashes are those of
+	// earlier versions. It is a value rather than a pointer so that a
+	// Result stays comparable and never shares memory with the results
+	// table.
+	Play PlayOutcome `json:"play,omitzero"`
 }
 
 // OK reports whether the command took effect (on first application) or was
