@@ -9,16 +9,46 @@ using System.Threading.Tasks;
 
 namespace PaxosArena.Client.Harness
 {
+    /// <summary>One request the transport sent and what came back, for the harness's assertions.</summary>
+    public sealed class Exchange
+    {
+        public string Method = "";
+        public string Url = "";
+
+        /// <summary>The request's Idempotency-Key, or "".</summary>
+        public string Key = "";
+
+        /// <summary>The HTTP status, or 0 when no response arrived.</summary>
+        public int Status;
+
+        public string Body = "";
+        public HttpHeader[] Headers = new HttpHeader[0];
+
+        public string Header(string name)
+        {
+            foreach (HttpHeader h in Headers)
+            {
+                if (string.Equals(h.Name, name, StringComparison.OrdinalIgnoreCase))
+                {
+                    return h.Value;
+                }
+            }
+            return "";
+        }
+    }
+
     /// <summary>
     /// IHttpTransport over HttpClient, used only by the harness. Redirects are
     /// disabled. Requests run on the thread pool; their callbacks are queued and
     /// run by <see cref="Dispatch"/>, which the harness calls on the thread that
-    /// calls ArenaClient.Update, as the interface requires.
+    /// calls ArenaClient.Update, as the interface requires. Every exchange is
+    /// also recorded as soon as it ends, dispatched or not.
     /// </summary>
     public sealed class HttpClientTransport : IHttpTransport, IDisposable
     {
         readonly HttpClient http;
         readonly ConcurrentQueue<Action> ready = new ConcurrentQueue<Action>();
+        readonly ConcurrentQueue<Exchange> exchanges = new ConcurrentQueue<Exchange>();
         CancellationTokenSource cancel = new CancellationTokenSource();
         int inFlight;
 
@@ -38,6 +68,12 @@ namespace PaxosArena.Client.Harness
             get { return Volatile.Read(ref inFlight); }
         }
 
+        /// <summary>The exchanges that ended so far, in the order they ended.</summary>
+        public Exchange[] Exchanges
+        {
+            get { return exchanges.ToArray(); }
+        }
+
         public void Send(HttpRequest request, Action<HttpResponse> done)
         {
             Interlocked.Increment(ref inFlight);
@@ -45,6 +81,15 @@ namespace PaxosArena.Client.Harness
             _ = Task.Run(async () =>
             {
                 HttpResponse response = await Run(request, token).ConfigureAwait(false);
+                exchanges.Enqueue(new Exchange
+                {
+                    Method = request.Method,
+                    Url = request.Url,
+                    Key = request.Header(Headers.IdempotencyKey),
+                    Status = response.Status,
+                    Body = response.Body,
+                    Headers = response.Headers,
+                });
                 Interlocked.Decrement(ref inFlight);
                 ready.Enqueue(() => done(response));
             });

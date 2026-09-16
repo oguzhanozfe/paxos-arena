@@ -161,6 +161,8 @@ namespace PaxosArena.Client.Harness
             public string LastMoveBody = "";
             public string LastMovePath = "";
             public IntentOutcome LastMove;
+            public bool IllegalMoveSent;
+            public readonly List<HttpClientTransport> Transports = new List<HttpClientTransport>();
 
             public long Total
             {
@@ -208,11 +210,25 @@ namespace PaxosArena.Client.Harness
                 {
                     Fail("the kill-leader command never ran");
                 }
+                if (!players[0].IllegalMoveSent)
+                {
+                    Fail("no round offered a column to play illegally");
+                }
                 ReplaysAndSequenceErrors(players[0]);
                 Restart(players[players.Count > 1 ? 1 : 0]);
                 Dictionary<string, long[]> payouts = LeaderboardCloseSettle();
                 Events(payouts);
                 Claims(payouts);
+                LedgerThroughOperatorApi(payouts);
+                int sessions = 0;
+                foreach (Player p in players)
+                {
+                    foreach (HttpClientTransport transport in p.Transports)
+                    {
+                        sessions += Array.FindAll(transport.Exchanges, e => e.Status == 200 && e.Method == "POST" && e.Url.EndsWith("/v1/session", StringComparison.Ordinal)).Length;
+                    }
+                }
+                Step("sessions answered 200: " + sessions + " for " + players.Count + " players (two each in step 2; the rest refreshed a token before expiry or after a restart)");
             }
             finally
             {
@@ -309,26 +325,37 @@ namespace PaxosArena.Client.Harness
             {
                 Check(Same(LadderAudit.PlayableFromView(view), view.playable_columns), "playable_columns at move " + view.move_index);
                 Check(view.seed == "", "seed revealed while playing");
-                if (options.KillLeaderCommand.Length > 0 && !killed && p.Index == 0 && round == 2 && view.move_index == 5)
+                if (p.Index == 0 && !p.IllegalMoveSent)
                 {
-                    KillLeader();
+                    int illegal = IllegalColumn(view);
+                    if (illegal >= 0)
+                    {
+                        IllegalMove(p, round, view, illegal);
+                    }
                 }
                 RoundView before = view;
                 string kind = before.playable_columns.Length > 0 ? MoveKind.Play : MoveKind.Draw;
                 int column = kind == MoveKind.Play ? before.playable_columns[0] : MoveKind.NoColumn;
                 Check(kind == MoveKind.Play || before.can_draw, "no legal move offered at move " + before.move_index);
-                ArenaResult<RoundResponse> moved = Ok<RoundResponse>(p, "move " + before.move_index + " of round " + round, done =>
+                if (options.KillLeaderCommand.Length > 0 && !killed && p.Index == 0 && round == 2 && view.move_index == 5)
                 {
-                    if (kind == MoveKind.Play)
+                    view = KillLeaderWithMoveUnanswered(p, round, before, kind, column);
+                }
+                else
+                {
+                    ArenaResult<RoundResponse> moved = Ok<RoundResponse>(p, "move " + before.move_index + " of round " + round, done =>
                     {
-                        p.Client.Play(tid, round, before.move_index, column, done);
-                    }
-                    else
-                    {
-                        p.Client.Draw(tid, round, before.move_index, done);
-                    }
-                });
-                view = moved.Value.round;
+                        if (kind == MoveKind.Play)
+                        {
+                            p.Client.Play(tid, round, before.move_index, column, done);
+                        }
+                        else
+                        {
+                            p.Client.Draw(tid, round, before.move_index, done);
+                        }
+                    });
+                    view = moved.Value.round;
+                }
                 Check(view.move_index == before.move_index + 1, "move_index " + view.move_index + " after " + before.move_index);
                 moves.Add(new KeyValuePair<string, int>(kind, column));
                 p.LastMove = LastOutcome(p, IntentRoutes.Move);
@@ -358,6 +385,194 @@ namespace PaxosArena.Client.Harness
             Step("3 player " + p.Index + " round " + round + ": " + moves.Count + " moves, " + final.finish_reason + ", score " + final.score + ", seed verified");
         }
 
+        /// <summary>A non-empty column whose top card does not fit the waste card, or -1.</summary>
+        static int IllegalColumn(RoundView view)
+        {
+            for (int c = 0; c < view.columns.Length; c++)
+            {
+                if (view.columns[c].cards.Length > 0 && Array.IndexOf(view.playable_columns, c) < 0)
+                {
+                    return c;
+                }
+            }
+            return -1;
+        }
+
+        /// <summary>
+        /// Plays a column the rules refuse: the answer is a definitive 409
+        /// illegal_move that consumed its sequence number, the board is
+        /// unchanged, and the client carries on without resynchronising.
+        /// </summary>
+        void IllegalMove(Player p, int round, RoundView view, int column)
+        {
+            int resyncs = p.Resyncs;
+            ArenaResult<RoundResponse> bad = Await<RoundResponse>(p, "illegal play of column " + column,
+                done => p.Client.Play(tid, round, view.move_index, column, done));
+            Check(!bad.Ok && bad.Error.Status == 409 && bad.Error.Code == ErrorCodes.IllegalMove && !bad.Error.Retryable,
+                "an illegal move must be answered 409 illegal_move, got " + (bad.Ok ? "success" : bad.Error.ToString()));
+            IntentOutcome outcome = LastOutcome(p, IntentRoutes.Move);
+            Exchange answer = LastAnswer(p.Transport, outcome.IdempotencyKey);
+            Check(answer != null && answer.Header(Headers.NextSeq) == (outcome.Seq + 1).ToString(CultureInfo.InvariantCulture),
+                "the illegal move's answer must carry X-Arena-Next-Seq " + (outcome.Seq + 1) + ", got " + (answer == null ? "no answer" : answer.Header(Headers.NextSeq)));
+            Check(p.Store.Load().last_assigned_seq == outcome.Seq && p.Client.PendingCount == 0, "the rejection is definitive and keeps the numbering");
+            ArenaResult<RoundResponse> read = Ok<RoundResponse>(p, "round after the illegal move", done => p.Client.GetRound(tid, round, done));
+            Check(read.Value.round.move_index == view.move_index && json.ToJson(read.Value.round) == json.ToJson(view),
+                "the illegal move changed the board");
+            Check(p.Resyncs == resyncs, "an illegal move must not resynchronise the client");
+            p.IllegalMoveSent = true;
+            Step("3 player " + p.Index + " round " + round + ": play of column " + column + " at move " + view.move_index +
+                 " answered 409 illegal_move; seq " + outcome.Seq + " consumed, board unchanged");
+        }
+
+        /// <summary>
+        /// The leader answers a move, the answer never reaches the game, the
+        /// leader's process is killed and the app dies with it. A client rebuilt
+        /// from the store resends the move with its key: the cached leader does
+        /// not answer, a follower redirects, and the new leader replays the
+        /// recorded result.
+        /// </summary>
+        RoundView KillLeaderWithMoveUnanswered(Player p, int round, RoundView before, string kind, int column)
+        {
+            Check(options.Operator.Length == options.Play.Length,
+                "--kill-leader-command needs one --operator URL per --play URL, in the same node order");
+            string oldLeader = p.Store.Load().leader_url;
+            int oldIndex = Array.IndexOf(options.Play, oldLeader);
+            Check(oldIndex >= 0, "the client caches the leader before the kill, got '" + oldLeader + "'");
+            // Let the player's intents bucket (burst 20, one per 100 ms) refill,
+            // so the leader applies the move instead of answering 429.
+            Thread.Sleep(2500);
+            bool oldCallback = false;
+            if (kind == MoveKind.Play)
+            {
+                p.Client.Play(tid, round, before.move_index, column, r => oldCallback = true);
+            }
+            else
+            {
+                p.Client.Draw(tid, round, before.move_index, r => oldCallback = true);
+            }
+            p.Client.Update();
+            ClientState stored = p.Store.Load();
+            Check(stored.pending.Length == 1 && stored.pending[0].route == IntentRoutes.Move, "the move is stored before it is sent");
+            string key = stored.pending[0].idempotency_key;
+            long seq = stored.pending[0].seq;
+            // Wait for the answer without dispatching it to the client.
+            long deadline = clock.ElapsedMilliseconds + options.StepTimeoutSeconds * 1000L;
+            while (!Array.Exists(p.Transport.Exchanges, e => e.Key == key))
+            {
+                Check(clock.ElapsedMilliseconds < deadline, "the leader did not answer the move within " + options.StepTimeoutSeconds + " s");
+                Thread.Sleep(2);
+            }
+            Exchange first = LastAnswer(p.Transport, key);
+            Check(first != null && first.Status == 200 && first.Url.StartsWith(oldLeader + "/", StringComparison.Ordinal),
+                "the leader must have applied the move before the kill: " + Describe(first));
+            KillLeader();
+            // The app dies too, with the answer still undelivered.
+            p.Client.Dispose();
+            p.Transport.Dispose();
+            int newIndex = WaitForNewLeader(oldIndex);
+            int followerIndex = 0;
+            while (followerIndex == oldIndex || followerIndex == newIndex)
+            {
+                followerIndex++;
+            }
+            Check(followerIndex < options.Play.Length, "a follower survives the kill");
+            // The store still caches the killed leader. With the base URLs in
+            // this order, the client that drops it moves on to the follower.
+            Build(p, new[] { options.Play[oldIndex], options.Play[followerIndex], options.Play[newIndex] });
+            PumpUntil(() => FindOutcome(p, key) != null, "the stored move completed after the kill");
+            IntentOutcome outcome = FindOutcome(p, key);
+            Check(outcome.Error == null && outcome.Status == 200 && outcome.Seq == seq,
+                "resumed move: " + (outcome.Error != null ? outcome.Error.ToString() : outcome.Status.ToString()));
+            RoundResponse resumed = json.FromJson<RoundResponse>(outcome.Body);
+            Check(resumed.replayed && resumed.round.move_index == before.move_index + 1,
+                "the new leader must replay the move applied before the kill: replayed " + resumed.replayed + ", move_index " + resumed.round.move_index);
+            Check(resumed.slot.ToString(CultureInfo.InvariantCulture) == first.Header(Headers.Slot),
+                "the replay names slot " + resumed.slot + ", the first answer " + first.Header(Headers.Slot));
+            List<Exchange> sends = new List<Exchange>();
+            foreach (Exchange e in p.Transport.Exchanges)
+            {
+                if (e.Key == key)
+                {
+                    sends.Add(e);
+                }
+            }
+            bool lost = sends.Exists(e => e.Status == 0 && e.Url.StartsWith(options.Play[oldIndex] + "/", StringComparison.Ordinal));
+            bool redirected = sends.Exists(e => e.Status == 307 && e.Url.StartsWith(options.Play[followerIndex] + "/", StringComparison.Ordinal) &&
+                                                e.Header(Headers.Location).StartsWith(options.Play[newIndex] + "/", StringComparison.Ordinal));
+            Exchange last = sends.Count > 0 ? sends[sends.Count - 1] : null;
+            Check(lost && redirected && last != null && last.Status == 200 && last.Url.StartsWith(options.Play[newIndex] + "/", StringComparison.Ordinal),
+                "the resend must fail on the killed leader, follow the follower's 307 and end on the new leader: " + string.Join("; ", sends.ConvertAll(Describe)));
+            Check(p.Store.Load().leader_url == options.Play[newIndex], "the new leader is cached");
+            Check(!oldCallback && p.Client.PendingCount == 0, "resume bookkeeping");
+            p.LastMove = outcome;
+            Step("3 player " + p.Index + " round " + round + ": move " + before.move_index + " (seq " + seq + ", key " + key +
+                 ") applied, leader killed before the answer was delivered, client rebuilt from its store; resend: " +
+                 string.Join(" -> ", sends.ConvertAll(e => Origin(e.Url) + " " + (e.Status == 0 ? "no response" : e.Status.ToString(CultureInfo.InvariantCulture)))) +
+                 " replayed");
+            return resumed.round;
+        }
+
+        /// <summary>Polls the operator API of every node but the killed one until one is a ready leader.</summary>
+        int WaitForNewLeader(int killed)
+        {
+            long deadline = clock.ElapsedMilliseconds + options.StepTimeoutSeconds * 1000L;
+            while (true)
+            {
+                for (int i = 0; i < options.Operator.Length; i++)
+                {
+                    if (i == killed)
+                    {
+                        continue;
+                    }
+                    HttpResponse r = SendOnce("GET", options.Operator[i] + "/v1/node", "", "", "");
+                    if (r.Status != 200)
+                    {
+                        continue;
+                    }
+                    using (JsonDocument doc = JsonDocument.Parse(r.Body))
+                    {
+                        JsonElement node = doc.RootElement;
+                        if (node.GetProperty("role").GetString() == "leader" && node.GetProperty("ready").GetBoolean())
+                        {
+                            Step("3 node at " + options.Operator[i] + " leads after the kill");
+                            return i;
+                        }
+                    }
+                }
+                Check(clock.ElapsedMilliseconds < deadline, "no new leader within " + options.StepTimeoutSeconds + " s of the kill");
+                Thread.Sleep(50);
+            }
+        }
+
+        /// <summary>The last exchange for key that received an answer other than a redirect.</summary>
+        static Exchange LastAnswer(HttpClientTransport transport, string key)
+        {
+            Exchange found = null;
+            foreach (Exchange e in transport.Exchanges)
+            {
+                if (e.Key == key && e.Status != 0 && e.Status != 307)
+                {
+                    found = e;
+                }
+            }
+            return found;
+        }
+
+        static string Describe(Exchange e)
+        {
+            if (e == null)
+            {
+                return "no exchange";
+            }
+            return e.Method + " " + e.Url + " -> " + (e.Status == 0 ? "no response" : e.Status + " " + e.Body);
+        }
+
+        static string Origin(string url)
+        {
+            Uri uri;
+            return Uri.TryCreate(url, UriKind.Absolute, out uri) ? uri.GetLeftPart(UriPartial.Authority) : url;
+        }
+
         void KillLeader()
         {
             Step("3 running the kill-leader command");
@@ -382,14 +597,38 @@ namespace PaxosArena.Client.Harness
 
         void ReplaysAndSequenceErrors(Player p)
         {
+            Exchange firstAnswer = LastAnswer(p.Transport, p.LastMove.IdempotencyKey);
+            Check(firstAnswer != null && firstAnswer.Status == p.LastMove.Status && firstAnswer.Body == p.LastMove.Body, "the last move's answer was recorded");
             HttpResponse replay = RawPost(p, p.LastMovePath, p.LastMove.IdempotencyKey, p.LastMoveBody);
             Check(replay.Status == p.LastMove.Status, "replay status " + replay.Status + ", first " + p.LastMove.Status);
-            RoundResponse original = json.FromJson<RoundResponse>(p.LastMove.Body);
-            RoundResponse again = json.FromJson<RoundResponse>(replay.Body);
-            Check(!original.replayed && again.replayed, "replayed flag");
-            Check(again.slot == original.slot && again.next_seq == original.next_seq && json.ToJson(again.round) == json.ToJson(original.round),
-                "the replayed body differs from the first");
-            Step("4 resent the last move with its key: identical body, replayed true");
+            const string FirstPrefix = "{\"replayed\":false,";
+            const string ReplayPrefix = "{\"replayed\":true,";
+            Check(p.LastMove.Body.StartsWith(FirstPrefix, StringComparison.Ordinal) &&
+                  replay.Body == ReplayPrefix + p.LastMove.Body.Substring(FirstPrefix.Length),
+                "the replayed body must equal the recorded response but for replayed:\n  first  " + p.LastMove.Body + "\n  replay " + replay.Body);
+            foreach (string header in new[] { Headers.Slot, Headers.NextSeq })
+            {
+                Check(replay.Header(header).Length > 0 && replay.Header(header) == firstAnswer.Header(header),
+                    header + " of the replay is '" + replay.Header(header) + "', the first answer's '" + firstAnswer.Header(header) + "'");
+            }
+            Step("4 resent the last move with its key (seq " + p.LastMove.Seq + "): status " + replay.Status + ", " + Headers.Slot + " " +
+                 replay.Header(Headers.Slot) + ", body byte-identical but for replayed:true");
+
+            // A captured move under a new key: its number was used, and nothing
+            // is consumed. The rejection is recorded under the new key.
+            string staleKey = Guid.NewGuid().ToString("N");
+            long next = p.Store.Load().last_assigned_seq + 1;
+            HttpResponse stale = RawPost(p, p.LastMovePath, staleKey, p.LastMoveBody);
+            ErrorBody staleError = json.FromJson<ErrorBody>(stale.Body);
+            Check(stale.Status == 409 && staleError.code == ErrorCodes.StaleSeq && !staleError.retryable,
+                "a used seq under a new key must be 409 stale_seq, got " + stale.Status + " " + stale.Body);
+            Check(stale.Header(Headers.NextSeq) == next.ToString(CultureInfo.InvariantCulture),
+                "stale_seq carries X-Arena-Next-Seq " + next + ", got '" + stale.Header(Headers.NextSeq) + "'");
+            HttpResponse staleAgain = RawPost(p, p.LastMovePath, staleKey, p.LastMoveBody);
+            Check(staleAgain.Status == 409 && staleAgain.Body == stale.Body && staleAgain.Header(Headers.Slot) == stale.Header(Headers.Slot),
+                "the recorded stale_seq must be answered again unchanged, got " + staleAgain.Status + " " + staleAgain.Body);
+            Step("4 the last move's body (seq " + p.LastMove.Seq + ") under a new key: 409 stale_seq, " + Headers.NextSeq + " " + next +
+                 "; resent with that key: the same 409");
 
             SequenceError(p, -1, ErrorCodes.StaleSeq);
             SequenceError(p, 3, ErrorCodes.SeqGap);
@@ -588,15 +827,83 @@ namespace PaxosArena.Client.Harness
             Step("8 claims sum to the pool minus withheld amounts");
         }
 
+        /// <summary>
+        /// Reads the tournament's ledger through the operator API: one fee per
+        /// entrant, one prize posting per paid place, and exactly one claim
+        /// posting per paid player, with the claimed amount.
+        /// </summary>
+        void LedgerThroughOperatorApi(Dictionary<string, long[]> payouts)
+        {
+            HttpResponse r = Operator("GET", "/v1/tournaments/" + tid + "/ledger", "");
+            Check(r.Status == 200, "ledger: HTTP " + r.Status + " " + r.Body);
+            Dictionary<string, int> kinds = new Dictionary<string, int>();
+            Dictionary<string, int> keys = new Dictionary<string, int>();
+            Dictionary<string, long> claims = new Dictionary<string, long>();
+            int claimPostings = 0;
+            using (JsonDocument doc = JsonDocument.Parse(r.Body))
+            {
+                foreach (JsonElement posting in doc.RootElement.GetProperty("postings").EnumerateArray())
+                {
+                    string kind = posting.GetProperty("kind").GetString();
+                    string key = posting.GetProperty("key").GetString();
+                    int n;
+                    kinds.TryGetValue(kind, out n);
+                    kinds[kind] = n + 1;
+                    keys.TryGetValue(key, out n);
+                    keys[key] = n + 1;
+                    if (kind == "claim")
+                    {
+                        claimPostings++;
+                        string player = posting.GetProperty("player").GetString();
+                        Check(key == "claim:" + tid + ":" + player && posting.GetProperty("debit").GetString() == "player:" + player &&
+                              posting.GetProperty("credit").GetString() == "claims:" + tid, "claim posting " + posting.GetRawText());
+                        long sum;
+                        claims.TryGetValue(player, out sum);
+                        claims[player] = sum + posting.GetProperty("amount").GetInt64();
+                    }
+                }
+            }
+            foreach (KeyValuePair<string, int> key in keys)
+            {
+                Check(key.Value == 1, "posting key " + key.Key + " appears " + key.Value + " times");
+            }
+            int paid = 0;
+            foreach (Player p in players)
+            {
+                long[] sums;
+                long expected = payouts.TryGetValue(p.Id, out sums) ? sums[0] : 0;
+                long got;
+                claims.TryGetValue(p.Id, out got);
+                Check(got == expected, "player " + p.Index + " claimed " + got + " in the ledger, expected " + expected);
+                if (expected > 0)
+                {
+                    paid++;
+                }
+            }
+            int fees, prizes;
+            kinds.TryGetValue("entry_fee", out fees);
+            kinds.TryGetValue("prize", out prizes);
+            Check(claimPostings == paid && fees == players.Count && prizes == paid,
+                "ledger postings by kind: " + string.Join(", ", new List<string>(kinds.Keys).ConvertAll(k => k + " " + kinds[k])));
+            Step("8 ledger through the operator API: " + fees + " entry fees, " + prizes + " prizes, exactly one claim posting for each of the " +
+                 paid + " paid players, every posting key once");
+        }
+
         // ---- plumbing ----
 
         void Build(Player p)
         {
+            Build(p, options.Play);
+        }
+
+        void Build(Player p, string[] baseUrls)
+        {
             p.Transport = new HttpClientTransport();
+            p.Transports.Add(p.Transport);
             p.Store = new FileIntentStore(json, p.Dir);
             p.Client = new ArenaClient(new ArenaClientOptions
             {
-                BaseUrls = options.Play,
+                BaseUrls = baseUrls,
                 Jurisdiction = "TR",
                 Age = 30,
                 FollowEvents = true,
