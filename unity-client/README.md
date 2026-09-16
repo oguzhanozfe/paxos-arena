@@ -238,11 +238,19 @@ dotnet build "unity-client/Tests~/UnityStubs/SampleCheck/SampleCheck.csproj"
 # Unit tests of the Core with a fake transport and clock
 dotnet run --project "unity-client/Tests~/Harness/Harness.csproj" -- --unit
 
-# The flow of section 11.6 against a live cluster started with -play-listen
+# The flow of section 11.6 against a live cluster started with -play-listen, for example
+# ARENA_SESSION_KEYS=k1=$(openssl rand -hex 32) ARENA_DEAL_SECRET=$(openssl rand -hex 32) \
+#     arena -nodes 3 -listen 127.0.0.1:8081 -play-listen 127.0.0.1:9081
 dotnet run --project "unity-client/Tests~/Harness/Harness.csproj" -- \
     --play http://127.0.0.1:9081,http://127.0.0.1:9082,http://127.0.0.1:9083 \
-    --operator http://127.0.0.1:8081 --players 3 [--kill-leader-command CMD]
+    --operator http://127.0.0.1:8081,http://127.0.0.1:8082,http://127.0.0.1:8083 \
+    --players 3 [--kill-leader-command CMD]
 ```
+
+`--kill-leader-command` runs CMD in the middle of round 2 and requires the
+flow to finish anyway. That only makes sense with one replica per process
+(`arena -id N -peers ... -wal ... -play-listen ... -play-urls ...`), where CMD
+kills the leader's process and the other two keep a majority.
 
 The unit tests cover backoff and `Retry-After`, the server clock, the session
 at start and its credentials, and intents that are stored before sending and

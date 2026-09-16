@@ -21,7 +21,7 @@ namespace PaxosArena.Client.Harness
         const string Usage =
             "usage:\n" +
             "  Harness --unit [--filter TEXT]\n" +
-            "  Harness --play URL[,URL...] --operator URL [--players N] [--kill-leader-command CMD]\n" +
+            "  Harness --play URL[,URL...] --operator URL[,URL...] [--players N] [--kill-leader-command CMD]\n" +
             "          [--store DIR] [--step-timeout SECONDS]";
 
         public static int Main(string[] args)
@@ -57,7 +57,7 @@ namespace PaxosArena.Client.Harness
         public bool Unit;
         public string Filter = "";
         public string[] Play = new string[0];
-        public string Operator = "";
+        public string[] Operator = new string[0];
         public int Players = 3;
         public string KillLeaderCommand = "";
         public string StoreDir = "";
@@ -100,7 +100,7 @@ namespace PaxosArena.Client.Harness
                         options.Play = value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
                         break;
                     case "--operator":
-                        options.Operator = value.TrimEnd('/');
+                        options.Operator = value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
                         break;
                     case "--players":
                         if (!int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out options.Players) || options.Players < 1 || options.Players > 50)
@@ -676,7 +676,7 @@ namespace PaxosArena.Client.Harness
 
         HttpResponse Operator(string method, string path, string body)
         {
-            return Send(new[] { options.Operator }, method, path, body, "op" + Guid.NewGuid().ToString("N"), "");
+            return Send(options.Operator, method, path, body, "op" + Guid.NewGuid().ToString("N"), "");
         }
 
         HttpResponse RawPost(Player p, string path, string key, string body)
@@ -690,8 +690,9 @@ namespace PaxosArena.Client.Harness
         }
 
         /// <summary>
-        /// Sends one request outside the SDK: follows a 307 once, and on a lost
-        /// connection, a 503 or a second 307 waits and tries the next base URL.
+        /// Sends one request outside the SDK: follows a 307 once; waits out a
+        /// 429 or an in_flight answer; and on a lost connection or a 503 waits
+        /// and tries the next base URL.
         /// </summary>
         HttpResponse Send(string[] bases, string method, string path, string body, string key, string token)
         {
@@ -705,7 +706,8 @@ namespace PaxosArena.Client.Harness
                 {
                     r = SendOnce(method, r.Header("Location"), body, key, token);
                 }
-                bool retry = r.Status == 0 || r.Status == 503 || r.Status == 307 || (r.Status == 409 && r.Body.Contains("\"in_flight\""));
+                bool retry = r.Status == 0 || r.Status == 429 || r.Status == 503 || r.Status == 307 ||
+                             (r.Status == 409 && r.Body.Contains("\"in_flight\""));
                 if (!retry || clock.ElapsedMilliseconds > deadline)
                 {
                     return r;
@@ -714,12 +716,12 @@ namespace PaxosArena.Client.Harness
                 {
                     target = r.Header("Location");
                 }
-                else
+                else if (r.Status == 0 || r.Status == 503)
                 {
                     index = (index + 1) % bases.Length;
                     target = bases[index] + path;
                 }
-                Thread.Sleep(300);
+                Thread.Sleep((int)Math.Max(300, 1000 * Backoff.ParseRetryAfter(r.Header("Retry-After"))));
             }
         }
 
