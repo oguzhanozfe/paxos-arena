@@ -356,7 +356,11 @@ type Tournament struct {
 	ClosedAt paxos.Slot `json:"closed_at"`
 	// SettledAt is the slot of the Settle command; 0 until then.
 	SettledAt paxos.Slot `json:"settled_at"`
-	// Ballot is the ballot under which the Settle slot was chosen.
+	// Ballot is the ballot under which this replica learned the Settle slot
+	// was chosen. It is audit metadata of this replica, not replicated
+	// state: a value chosen under one ballot may be re-proposed and learned
+	// under a later one on another replica. Hash and EncodeTournament
+	// exclude it.
 	Ballot paxos.Ballot `json:"ballot"`
 }
 

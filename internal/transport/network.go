@@ -214,5 +214,24 @@ func (n *Network) Purge(node paxos.NodeID) {
 	heap.Init(&n.heap)
 }
 
+// Discard removes every queued envelope for which match returns true, as
+// Purge does for one recipient, and returns how many it removed. They count
+// as Dropped.
+func (n *Network) Discard(match func(replog.Envelope) bool) int {
+	kept := n.heap[:0]
+	removed := 0
+	for _, d := range n.heap {
+		if match(d.env) {
+			n.stats.Dropped++
+			removed++
+			continue
+		}
+		kept = append(kept, d)
+	}
+	n.heap = kept
+	heap.Init(&n.heap)
+	return removed
+}
+
 // Stats returns the counters so far.
 func (n *Network) Stats() Stats { return n.stats }

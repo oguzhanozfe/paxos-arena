@@ -1,12 +1,11 @@
 package sim
 
 import (
-	"crypto/sha256"
-	"encoding/binary"
 	"errors"
 	"time"
 
 	"github.com/oguzhanozfe/paxos-arena/internal/paxos"
+	"github.com/oguzhanozfe/paxos-arena/internal/replica"
 	"github.com/oguzhanozfe/paxos-arena/internal/replog"
 )
 
@@ -63,51 +62,21 @@ func (s *faultStore) SaveChosen(e replog.Entry) error {
 	return s.mem.SaveChosen(e)
 }
 
-// byteState is the stand-in state machine of this milestone: it applies
-// chosen entries in slot order, skips no-ops and keeps a hash chain over the
-// applied values. Two nodes with the same applied prefix have the same hash.
-type byteState struct {
-	applied paxos.Slot
-	hash    [32]byte
-	count   int
-}
-
-func newByteState() *byteState { return &byteState{} }
-
-// apply consumes the entry for slot applied+1 and returns the new hash.
-func (s *byteState) apply(e replog.Entry) [32]byte {
-	if e.Slot != s.applied+1 {
-		panic("sim: byteState.apply out of order")
-	}
-	s.applied = e.Slot
-	if e.NoOp() {
-		return s.hash
-	}
-	var slot [8]byte
-	binary.BigEndian.PutUint64(slot[:], uint64(e.Slot))
-	h := sha256.New()
-	h.Write(s.hash[:])
-	h.Write(slot[:])
-	h.Write(e.Value)
-	copy(s.hash[:], h.Sum(nil))
-	s.count++
-	return s.hash
-}
-
 // simNode is one replica in the simulation: its configuration, its store
-// (which survives crashes), the live Node (nil while crashed), the stand-in
-// state machine and its clock.
+// (which survives crashes), the live core (nil while crashed) with its log
+// node and tournament state machine, and its clock.
 type simNode struct {
-	id     paxos.NodeID
-	cfg    replog.Config
-	store  *faultStore
-	node   *replog.Node
-	sm     *byteState
-	alive  bool
-	frozen bool   // outside the healed core: never restarted
-	gen    uint64 // incremented on every crash; stale events carry an old gen
-	offset time.Duration
-	rate   float64
+	id      paxos.NodeID
+	cfg     replog.Config
+	store   *faultStore
+	core    *replica.Core
+	node    *replog.Node // core.Log(), nil while crashed
+	alive   bool
+	frozen  bool   // outside the healed core: never restarted
+	gen     uint64 // incremented on every crash; stale events carry an old gen
+	applied paxos.Slot
+	offset  time.Duration
+	rate    float64
 }
 
 // now maps the simulator's clock to this node's clock.

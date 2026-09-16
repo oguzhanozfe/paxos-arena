@@ -110,7 +110,11 @@ type Posting struct {
 	ExclusionVersion uint64 `json:"exclusion_version"`
 	// Slot is the log slot of the command that produced the posting.
 	Slot paxos.Slot `json:"slot"`
-	// Ballot is the ballot under which that slot was chosen.
+	// Ballot is the ballot under which the replica that holds this book
+	// learned the slot was chosen: audit metadata of that replica, which
+	// may differ from another replica's when a chosen value was re-proposed
+	// by a later leader. Book.Hash includes it; the tournament state
+	// machine's hash does not.
 	Ballot paxos.Ballot `json:"ballot"`
 }
 
@@ -219,6 +223,20 @@ func (b *Book) ForTournament(id string) []Posting {
 		}
 	}
 	return out
+}
+
+// CheckBalances verifies only that the balances sum to zero. It is the
+// cheap check a caller can afford after every posting; Check is the full
+// one.
+func (b *Book) CheckBalances() error {
+	var sum Money
+	for _, v := range b.balances {
+		sum += v
+	}
+	if sum != 0 {
+		return fmt.Errorf("ledger: balances sum to %d, want 0", sum)
+	}
+	return nil
 }
 
 // Check verifies the book's own consistency: every amount is positive,

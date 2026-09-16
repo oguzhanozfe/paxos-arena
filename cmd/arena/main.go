@@ -1,0 +1,345 @@
+// Command arena runs the replicated tournament settlement service.
+//
+// Without -peers it starts N replicas in one process, connected by an
+// in-memory bus, each with its own HTTP port, and prints curl commands that
+// exercise them. With -id and -peers it runs one replica per process over
+// the HTTP transport, so that a replica can be killed and restarted
+// independently of the others.
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log/slog"
+	"math/rand/v2"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/oguzhanozfe/paxos-arena/internal/api"
+	"github.com/oguzhanozfe/paxos-arena/internal/paxos"
+	"github.com/oguzhanozfe/paxos-arena/internal/replica"
+	"github.com/oguzhanozfe/paxos-arena/internal/replog"
+	"github.com/oguzhanozfe/paxos-arena/internal/transport"
+)
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, os.Args[1:], os.Stdout, os.Stderr); err != nil {
+		if !errors.Is(err, flag.ErrHelp) {
+			fmt.Fprintln(os.Stderr, "arena:", err)
+		}
+		os.Exit(1)
+	}
+}
+
+// shutdownTimeout bounds the graceful stop of an HTTP server.
+const shutdownTimeout = 5 * time.Second
+
+// run parses args and runs until ctx is done. It returns nil on a clean
+// stop and the first error otherwise.
+func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("arena", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	nodes := fs.Int("nodes", 3, "replicas to start in this process (ignored with -peers)")
+	listen := fs.String("listen", "127.0.0.1:8081", "listen address; with -nodes, node i listens on port+i-1 (port 0 picks free ports)")
+	id := fs.Uint("id", 0, "this replica's node id, for one replica per process (requires -peers)")
+	peers := fs.String("peers", "", "every replica as id=base-url, comma separated, for one replica per process")
+	logLevel := fs.String("log-level", "info", "log level: debug, info, warn, error")
+	logJSON := fs.Bool("log-json", false, "log JSON records instead of text")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	var level slog.LevelVar
+	if err := level.UnmarshalText([]byte(*logLevel)); err != nil {
+		return fmt.Errorf("-log-level: %w", err)
+	}
+	opts := &slog.HandlerOptions{Level: &level}
+	var handler slog.Handler = slog.NewTextHandler(stderr, opts)
+	if *logJSON {
+		handler = slog.NewJSONHandler(stderr, opts)
+	}
+	logger := slog.New(handler)
+	if *peers != "" {
+		return runSingle(ctx, paxos.NodeID(*id), *peers, *listen, logger, stdout)
+	}
+	if *id != 0 {
+		return errors.New("-id requires -peers")
+	}
+	return runCluster(ctx, *nodes, *listen, logger, stdout)
+}
+
+// newHTTPServer returns a server with every timeout set.
+func newHTTPServer(h http.Handler, logger *slog.Logger) *http.Server {
+	return &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 16,
+		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
+	}
+}
+
+// serve runs srv on ln until ctx is done, then shuts it down gracefully.
+func serve(ctx context.Context, srv *http.Server, ln net.Listener) error {
+	errc := make(chan error, 1)
+	go func() { errc <- srv.Serve(ln) }()
+	select {
+	case err := <-errc:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		sctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := srv.Shutdown(sctx); err != nil {
+			srv.Close()
+		}
+		<-errc
+		return nil
+	}
+}
+
+// seededRNG returns a generator for a node's election timeouts. The seed
+// is not secret; it only needs to differ between replicas.
+func seededRNG(id paxos.NodeID) *rand.Rand {
+	return rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), uint64(id)))
+}
+
+// runCluster starts n replicas on consecutive ports from listen and prints
+// how to exercise them.
+func runCluster(ctx context.Context, n int, listen string, logger *slog.Logger, stdout io.Writer) error {
+	if n < 1 {
+		return errors.New("-nodes must be at least 1")
+	}
+	host, portStr, err := net.SplitHostPort(listen)
+	if err != nil {
+		return fmt.Errorf("-listen: %w", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 0 || port > 65535 {
+		return fmt.Errorf("-listen: bad port %q", portStr)
+	}
+	ids := make([]paxos.NodeID, n)
+	listeners := make(map[paxos.NodeID]net.Listener, n)
+	urls := make(map[paxos.NodeID]string, n)
+	for i := range ids {
+		id := paxos.NodeID(i + 1)
+		ids[i] = id
+		addr := net.JoinHostPort(host, "0")
+		if port != 0 {
+			addr = net.JoinHostPort(host, strconv.Itoa(port+i))
+		}
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			for _, l := range listeners {
+				l.Close()
+			}
+			return fmt.Errorf("node %d: listen %s: %w", id, addr, err)
+		}
+		listeners[id] = ln
+		urls[id] = "http://" + ln.Addr().String()
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	bus := transport.NewLocal()
+	var wg sync.WaitGroup
+	errc := make(chan error, 2*n)
+	for _, id := range ids {
+		core, err := replica.NewCore(replog.DefaultConfig(id, ids), replog.NewMemStore(), seededRNG(id))
+		if err != nil {
+			cancel()
+			wg.Wait()
+			return err
+		}
+		runner := replica.NewRunner(core, bus.Send, logger)
+		bus.Register(id, runner.Deliver)
+		srv := newHTTPServer(api.New(api.Config{Self: id, Peers: urls}, runner, logger).Handler(), logger)
+		ln := listeners[id]
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if err := runner.Run(ctx); err != nil {
+				errc <- err
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if err := serve(ctx, srv, ln); err != nil {
+				errc <- err
+			}
+		}()
+	}
+	printClusterInstructions(stdout, ids, urls)
+	var first error
+	select {
+	case <-ctx.Done():
+	case first = <-errc:
+		logger.Error("replica failed", "err", first)
+	}
+	cancel()
+	wg.Wait()
+	return first
+}
+
+// parsePeers parses "1=http://a:8081,2=http://b:8082".
+func parsePeers(spec string) (map[paxos.NodeID]string, []paxos.NodeID, error) {
+	out := make(map[paxos.NodeID]string)
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(part, "=")
+		if !ok {
+			return nil, nil, fmt.Errorf("-peers: %q is not id=url", part)
+		}
+		id, err := strconv.ParseUint(strings.TrimSpace(k), 10, 32)
+		if err != nil || id == 0 {
+			return nil, nil, fmt.Errorf("-peers: bad node id %q", k)
+		}
+		v = strings.TrimRight(strings.TrimSpace(v), "/")
+		if !strings.HasPrefix(v, "http://") && !strings.HasPrefix(v, "https://") {
+			return nil, nil, fmt.Errorf("-peers: %q is not an http(s) base URL", v)
+		}
+		if _, dup := out[paxos.NodeID(id)]; dup {
+			return nil, nil, fmt.Errorf("-peers: node %d listed twice", id)
+		}
+		out[paxos.NodeID(id)] = v
+	}
+	if len(out) == 0 {
+		return nil, nil, errors.New("-peers: empty")
+	}
+	ids := make([]paxos.NodeID, 0, len(out))
+	for id := range out {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return out, ids, nil
+}
+
+// runSingle runs one replica over the HTTP transport.
+func runSingle(ctx context.Context, self paxos.NodeID, peersSpec, listen string, logger *slog.Logger, stdout io.Writer) error {
+	urls, ids, err := parsePeers(peersSpec)
+	if err != nil {
+		return err
+	}
+	if self == 0 {
+		return errors.New("-id is required with -peers")
+	}
+	if _, ok := urls[self]; !ok {
+		return fmt.Errorf("-id %d is not in -peers", self)
+	}
+	ln, err := net.Listen("tcp", listen)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", listen, err)
+	}
+	core, err := replica.NewCore(replog.DefaultConfig(self, ids), replog.NewMemStore(), seededRNG(self))
+	if err != nil {
+		ln.Close()
+		return err
+	}
+	var tr *transport.HTTP
+	runner := replica.NewRunner(core, func(env replog.Envelope) { tr.Send(env) }, logger)
+	tr = transport.NewHTTP(self, urls, runner.Deliver, nil, logger)
+	mux := http.NewServeMux()
+	mux.Handle("POST "+transport.Path, tr.Handler())
+	mux.Handle("/", api.New(api.Config{Self: self, Peers: urls}, runner, logger).Handler())
+	srv := newHTTPServer(mux, logger)
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var wg sync.WaitGroup
+	errc := make(chan error, 2)
+	wg.Add(3)
+	go func() { defer wg.Done(); tr.Run(ctx) }()
+	go func() {
+		defer wg.Done()
+		if err := serve(ctx, srv, ln); err != nil {
+			errc <- err
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if err := runner.Run(ctx); err != nil {
+			errc <- err
+		}
+	}()
+	fmt.Fprintf(stdout, "arena: node %d of %v listening on http://%s\n", self, ids, ln.Addr())
+	for _, id := range ids {
+		fmt.Fprintf(stdout, "  node %d  %s\n", id, urls[id])
+	}
+	fmt.Fprintln(stdout)
+	printCurl(stdout, urls[self], urls, ids)
+	var first error
+	select {
+	case <-ctx.Done():
+	case first = <-errc:
+		logger.Error("replica failed", "err", first)
+	}
+	cancel()
+	wg.Wait()
+	return first
+}
+
+func printClusterInstructions(w io.Writer, ids []paxos.NodeID, urls map[paxos.NodeID]string) {
+	fmt.Fprintf(w, "arena: %d replicas in one process, connected by an in-memory bus\n", len(ids))
+	for _, id := range ids {
+		fmt.Fprintf(w, "  node %d  %s\n", id, urls[id])
+	}
+	fmt.Fprintln(w)
+	printCurl(w, urls[ids[0]], urls, ids)
+	fmt.Fprintln(w, "To run replicas as separate processes (so one can be killed and restarted), start each with")
+	fmt.Fprintln(w, "  arena -id <n> -listen <host:port> -peers 1=http://127.0.0.1:8081,2=http://127.0.0.1:8082,3=http://127.0.0.1:8083")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Ctrl-C stops every replica. State is in memory and is lost on exit.")
+}
+
+// printCurl prints the curl commands of one full tournament.
+func printCurl(w io.Writer, base string, urls map[paxos.NodeID]string, ids []paxos.NodeID) {
+	other := base
+	for _, id := range ids {
+		if urls[id] != base {
+			other = urls[id]
+			break
+		}
+	}
+	fmt.Fprintln(w, "Any node accepts commands; a follower forwards to the leader. Every POST needs an Idempotency-Key.")
+	fmt.Fprintln(w, "Repeating a POST with the same key returns the recorded result with \"replayed\": true and changes nothing.")
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "  BASE=%s\n", base)
+	fmt.Fprintln(w, "  curl -s $BASE/v1/node")
+	fmt.Fprintln(w, "  curl -s -X POST $BASE/v1/tournaments -H 'Idempotency-Key: create-t1' -H 'Content-Type: application/json' \\")
+	fmt.Fprintln(w, `    -d '{"id":"t1","rules":{"entry_fee":500,"rake_bps":1000,"prize_bps":[5000,3000,2000],"min_entrants":3,"max_entrants":100,"max_score":100000,"min_age":18,"tie_break":"earliest_submission","exclusions":{"version":7,"jurisdictions":["XX"]}}}'`)
+	fmt.Fprintln(w, "  for p in p1 p2 p3; do")
+	fmt.Fprintln(w, "    curl -s -X POST $BASE/v1/tournaments/t1/entries -H \"Idempotency-Key: join-$p\" -H 'Content-Type: application/json' \\")
+	fmt.Fprintln(w, `      -d "{\"player\":{\"id\":\"$p\",\"jurisdiction\":\"TR\",\"age\":31}}"`)
+	fmt.Fprintln(w, "  done")
+	fmt.Fprintln(w, "  # the join responses carry \"seed\": the deal every entrant plays; scores must quote it")
+	fmt.Fprintln(w, "  SEED=$(curl -s \"$BASE/v1/tournaments/t1\" | sed -n 's/.*\"seed\": *\\([0-9]*\\).*/\\1/p' | head -1)")
+	fmt.Fprintln(w, "  i=0; for p in p1 p2 p3; do i=$((i+1))")
+	fmt.Fprintln(w, "    curl -s -X POST $BASE/v1/tournaments/t1/scores -H \"Idempotency-Key: score-$p\" -H 'Content-Type: application/json' \\")
+	fmt.Fprintln(w, `      -d "{\"player\":\"$p\",\"score\":$((i*1000)),\"deal_seed\":$SEED}"`)
+	fmt.Fprintln(w, "  done")
+	fmt.Fprintln(w, "  curl -s -X POST $BASE/v1/tournaments/t1/close -H 'Idempotency-Key: close-t1' -H 'Content-Type: application/json' -d '{}'")
+	fmt.Fprintln(w, "  curl -s -X POST $BASE/v1/tournaments/t1/settle -H 'Idempotency-Key: settle-t1' -H 'Content-Type: application/json' \\")
+	fmt.Fprintln(w, `    -d '{"exclusions":{"version":8,"jurisdictions":["XX","YY"]}}'`)
+	fmt.Fprintln(w, "  curl -s $BASE/v1/tournaments/t1            # consistent read, served by the leader")
+	fmt.Fprintln(w, "  curl -s $BASE/v1/tournaments/t1/ledger     # every posting of the tournament")
+	fmt.Fprintf(w, "  curl -s -i \"%s/v1/tournaments/t1?read=stale\"   # stale read from another node; see X-Arena-Applied-Slot\n", other)
+	fmt.Fprintln(w)
+}

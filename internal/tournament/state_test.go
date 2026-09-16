@@ -711,18 +711,30 @@ func TestReplayDeterministic(t *testing.T) {
 	if a.Ledger().Hash() != c.Ledger().Hash() {
 		t.Error("ledger differs after replay")
 	}
-	// A different ballot for the same commands changes the postings'
-	// audit fields and therefore the hash.
+	// The ballot is per-replica audit metadata: a replica that learned the
+	// same slots under other ballots holds the same replicated state and
+	// the same hash, while its records carry its own ballots.
 	d := New()
+	other := paxos.Ballot{Round: 3, Node: 2}
 	for i, cmd := range cmds {
 		slot := paxos.Slot(i + 1)
 		if slot%7 == 0 {
 			d.Skip(slot)
 			continue
 		}
-		d.Apply(slot, paxos.Ballot{Round: 3, Node: 2}, cmd)
+		d.Apply(slot, other, cmd)
 	}
-	if d.Hash() == a.Hash() {
-		t.Error("different ballots produced the same hash")
+	if d.Hash() != a.Hash() {
+		t.Error("different ballots changed the replicated state hash")
+	}
+	for _, id := range a.Tournaments() {
+		ta, _ := a.Tournament(id)
+		td, _ := d.Tournament(id)
+		if !bytes.Equal(EncodeTournament(ta), EncodeTournament(td)) {
+			t.Errorf("tournament %s differs under other ballots", id)
+		}
+		if ta.Status == Settled && (ta.Ballot != ballot || td.Ballot != other) {
+			t.Errorf("tournament %s records ballots %v and %v, want %v and %v", id, ta.Ballot, td.Ballot, ballot, other)
+		}
 	}
 }

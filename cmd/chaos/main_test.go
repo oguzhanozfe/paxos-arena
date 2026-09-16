@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -15,7 +16,7 @@ import (
 func TestRunPrintsReport(t *testing.T) {
 	before := runtime.NumGoroutine()
 	var stdout, stderr bytes.Buffer
-	args := []string{"-seed", "1", "-seeds", "2", "-nodes", "3", "-steps", "800", "-liveness-steps", "30000", "-log-level", "warn"}
+	args := []string{"-seed", "1", "-seeds", "2", "-nodes", "3", "-steps", "800", "-liveness-steps", "60000", "-log-level", "warn", "-no-summary"}
 	if err := run(t.Context(), args, &stdout, &stderr); err != nil {
 		t.Fatalf("run: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
 	}
@@ -27,7 +28,7 @@ func TestRunPrintsReport(t *testing.T) {
 		if !strings.HasPrefix(lines[i], want) {
 			t.Errorf("line %d = %q, want prefix %q", i, lines[i], want)
 		}
-		for _, field := range []string{"steps=", "elections=", "net{sent=", "completed=", "participants="} {
+		for _, field := range []string{"steps=", "elections=", "net{sent=", "completed=", "settled=", "keys=", "replays=", "participants="} {
 			if !strings.Contains(lines[i], field) {
 				t.Errorf("line %d lacks %q: %s", i, field, lines[i])
 			}
@@ -45,6 +46,28 @@ func TestRunPrintsReport(t *testing.T) {
 	}
 }
 
+// TestRunPrintsSummary checks the per-scenario table and the invariant
+// table that follow the report lines.
+func TestRunPrintsSummary(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	args := []string{"-seed", "3", "-seeds", "2", "-steps", "800", "-log-level", "error"}
+	if err := run(t.Context(), args, &stdout, &stderr); err != nil {
+		t.Fatalf("run: %v\nstdout:\n%s", err, stdout.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{"scenario  runs", "invariant  checks  result", "S1  ", "S8  ", "D1  ", "D6  ", "  ok  "} {
+		if !strings.Contains(out, want) {
+			t.Errorf("summary lacks %q:\n%s", want, out)
+		}
+	}
+	if !regexp.MustCompile(`(?m)^random\s+2\s+\d+.*\sok$`).MatchString(out) {
+		t.Errorf("summary lacks the random row with 2 runs:\n%s", out)
+	}
+	if strings.Contains(out, "not evaluated") {
+		t.Errorf("some invariant was not evaluated:\n%s", out)
+	}
+}
+
 func TestRunScenarioWithTrace(t *testing.T) {
 	dir := t.TempDir()
 	tracePath := filepath.Join(dir, "trace.txt")
@@ -56,6 +79,9 @@ func TestRunScenarioWithTrace(t *testing.T) {
 	if !strings.Contains(stdout.String(), `scenario="crash_restart_storm"`) {
 		t.Errorf("report lacks the scenario name: %s", stdout.String())
 	}
+	if !hasSummaryRow(stdout.String(), "crash_restart_storm") {
+		t.Errorf("summary lacks the scenario row: %s", stdout.String())
+	}
 	info, err := os.Stat(tracePath)
 	if err != nil {
 		t.Fatalf("trace file: %v", err)
@@ -65,12 +91,31 @@ func TestRunScenarioWithTrace(t *testing.T) {
 	}
 }
 
+func TestRunAllScenarios(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	args := []string{"-seed", "1", "-scenario", "all", "-steps", "1000", "-log-level", "error"}
+	if err := run(t.Context(), args, &stdout, &stderr); err != nil {
+		t.Fatalf("run: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+	}
+	for _, name := range []string{"leader_crash_mid_settlement", "client_retry_storm", "exclusion_change_at_settle", "late_learner"} {
+		if !hasSummaryRow(stdout.String(), name) {
+			t.Errorf("summary lacks a row for %s:\n%s", name, stdout.String())
+		}
+	}
+}
+
+// hasSummaryRow reports whether the summary table has a row for the
+// scenario with one run and an ok result.
+func hasSummaryRow(out, scenario string) bool {
+	return regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(scenario) + `\s+1\s+\d+.*\sok$`).MatchString(out)
+}
+
 func TestRunListScenarios(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if err := run(t.Context(), []string{"-list-scenarios"}, &stdout, &stderr); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"dueling_leaders", "late_learner"} {
+	for _, name := range []string{"dueling_leaders", "late_learner", "leader_crash_mid_settlement", "client_retry_storm", "exclusion_change_at_settle"} {
 		if !strings.Contains(stdout.String(), name+"\n") {
 			t.Errorf("scenario list lacks %s:\n%s", name, stdout.String())
 		}

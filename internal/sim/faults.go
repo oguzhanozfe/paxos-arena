@@ -79,9 +79,10 @@ func (r *Run) crash(nd *simNode, reason string) {
 		panic(fmt.Sprintf("sim: node %d store Load: %v", nd.id, err))
 	}
 	r.checker.observeCrash(nd, d)
-	r.tracef("node %d crashed (%s): role %s commit %d applied %d", nd.id, reason, nd.node.Role(), nd.node.CommitIndex(), nd.sm.applied)
+	r.tracef("node %d crashed (%s): role %s commit %d applied %d", nd.id, reason, nd.node.Role(), nd.node.CommitIndex(), nd.applied)
 	nd.alive = false
 	nd.node = nil
+	nd.core = nil
 	nd.gen++
 	nd.store.armed = false
 	r.net.Purge(nd.id)

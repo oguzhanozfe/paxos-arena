@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/oguzhanozfe/paxos-arena/internal/paxos"
+	"github.com/oguzhanozfe/paxos-arena/internal/replica"
 	"github.com/oguzhanozfe/paxos-arena/internal/replog"
 	"github.com/oguzhanozfe/paxos-arena/internal/transport"
 )
@@ -39,58 +40,10 @@ type Run struct {
 	reads       map[readKey]pendingRead
 	eager       []*simNode
 	late        *lateLearner
+	mid         *midSettlement
 	report      Report
 	violation   error
 	quorum      int
-}
-
-// Report summarises a run.
-type Report struct {
-	// Steps is the number of events processed.
-	Steps int
-	// Elections counts nodes becoming leader.
-	Elections int
-	// LeaderChanges counts every other change of the leader a node knows
-	// about.
-	LeaderChanges int
-	// Crashes counts crashes, including those a torn write caused.
-	Crashes int
-	// TornWrites counts Save calls that failed as torn writes.
-	TornWrites int
-	// Partitions counts partitions installed, random and scripted.
-	Partitions int
-	// Net holds the network counters.
-	Net transport.Stats
-	// Settled is reserved for the tournament state machine of the next
-	// milestone and is always 0 here.
-	Settled int
-	// Issued counts the distinct client commands generated.
-	Issued int
-	// Completed counts client commands observed chosen.
-	Completed int
-	// Submits counts Propose calls by clients.
-	Submits int
-	// Reads counts consistent reads started.
-	Reads int
-	// ReadsCompleted counts reads that reached ReadReady.
-	ReadsCompleted int
-	// ReadsFailed counts reads that ended in ReadFailed.
-	ReadsFailed int
-	// Applied is the highest applied slot on any node.
-	Applied paxos.Slot
-	// Commit is the highest commit index on any live node.
-	Commit paxos.Slot
-	// Participants is the number of core nodes that hold the final leader's
-	// ballot and its commit index when the liveness phase completed.
-	Participants int
-	// Nodes is the cluster size after the scenario adjusted it.
-	Nodes int
-	// LeaseEnabled reports whether the lease was on.
-	LeaseEnabled bool
-	// SimTime is the virtual clock at the end.
-	SimTime time.Duration
-	// Marks holds scenario-specific counters, keyed by scenario name.
-	Marks map[string]int
 }
 
 // New builds a run from p. trace, when non-nil, receives one line per event
@@ -130,7 +83,7 @@ func New(p Params, trace io.Writer) (*Run, error) {
 			cfg.LeaseDuration = 0
 		}
 		cfg.Unsafe = p.unsafe
-		nd := &simNode{id: id, cfg: cfg, store: newFaultStore(), sm: newByteState(), rate: 1}
+		nd := &simNode{id: id, cfg: cfg, store: newFaultStore(), rate: 1}
 		if p.ClockSkewMax > 0 {
 			nd.offset = time.Duration(r.rng.Int64N(int64(p.ClockSkewMax) + 1))
 			nd.rate = 0.5 + 1.5*r.rng.Float64()
@@ -144,7 +97,7 @@ func New(p Params, trace io.Writer) (*Run, error) {
 		}
 	}
 	for i := 0; i < p.Clients; i++ {
-		r.clients = append(r.clients, newClient(i, p.commandsPerClient()))
+		r.clients = append(r.clients, newClient(i, p.tournamentsPerBatch()))
 		r.schedule(event{at: r.jitter(clientInterval), kind: evClient, client: i})
 	}
 	r.schedule(event{at: faultInterval, kind: evFault})
@@ -234,14 +187,15 @@ func (r *Run) leaderNode() *simNode {
 	return l
 }
 
-// start builds the node from its store and schedules its ticks.
+// start builds the core from the node's store and schedules its ticks.
 func (r *Run) start(nd *simNode) error {
-	node, err := replog.New(nd.cfg, nd.store, r.rng)
+	core, err := replica.NewCore(nd.cfg, nd.store, r.rng)
 	if err != nil {
 		return fmt.Errorf("sim: node %d: %w", nd.id, err)
 	}
-	nd.node = node
-	nd.sm = newByteState()
+	nd.core = core
+	nd.node = core.Log()
+	nd.applied = 0
 	nd.alive = true
 	r.schedule(event{at: r.clock + tickInterval, kind: evTick, node: r.index(nd), gen: nd.gen})
 	return nil
@@ -289,7 +243,7 @@ func (r *Run) deliver(env replog.Envelope) {
 		return
 	}
 	r.tracef("deliver %d->%d %s", env.From, env.To, describe(env.Msg))
-	r.callNode(nd, &env, func(now time.Duration) []replog.Envelope { return nd.node.Step(now, env) })
+	r.callNode(nd, &env, func(now time.Duration) []replog.Envelope { return nd.core.Step(now, env) })
 }
 
 // callNode wraps one call into a node with the checker's before and after
@@ -301,7 +255,7 @@ func (r *Run) callNode(nd *simNode, delivered *replog.Envelope, fn func(now time
 }
 
 func (r *Run) afterCall(nd *simNode, delivered *replog.Envelope, outs []replog.Envelope) {
-	if err := nd.node.Failed(); err != nil {
+	if err := nd.core.Failed(); err != nil {
 		r.tracef("node %d: %v", nd.id, err)
 		r.crash(nd, "torn write")
 		return
@@ -314,14 +268,25 @@ func (r *Run) afterCall(nd *simNode, delivered *replog.Envelope, outs []replog.E
 	for _, ev := range nd.node.Events() {
 		r.onNodeEvent(nd, ev)
 	}
+	if r.scenario != nil && r.scenario.onCall != nil {
+		r.scenario.onCall(r, nd, delivered, outs)
+		if !nd.alive {
+			return
+		}
+	}
 	r.applyCommitted(nd)
+	if !nd.alive {
+		return
+	}
 	r.checker.afterCall(r, nd, delivered, outs)
 	// Reads queued by events of this call run now, after the checker has
 	// seen the call, so their own before/after hooks do not nest.
 	for len(r.eager) > 0 {
 		next := r.eager[0]
 		r.eager = r.eager[1:]
-		r.issueRead(next, -1)
+		if next.alive {
+			r.issueRead(next, -1)
+		}
 	}
 }
 
@@ -352,28 +317,40 @@ func (r *Run) onNodeEvent(nd *simNode, ev replog.Event) {
 			r.tracef("node %d read %d failed: %v", nd.id, e.Seq, e.Err)
 		}
 	case replog.LearnConflict:
-		r.checker.fail(r, "S1", "node %d received Learn for slot %d with value %q at %v but had chosen %q at %v",
-			nd.id, e.Slot, e.Got.Value, e.Got.Ballot, e.Have.Value, e.Have.Ballot)
+		r.checker.fail(r, "S1", "node %d received Learn for slot %d with value %s at %v but had chosen %s at %v",
+			nd.id, e.Slot, describeValue(e.Got.Value), e.Got.Ballot, describeValue(e.Have.Value), e.Have.Ballot)
 	}
 }
 
 // applyCommitted feeds up to applyBatch chosen entries above the node's
-// applied slot into its state machine, in order.
+// applied slot into its state machine, in order, with the checker's hooks
+// around each one. A scripted scenario may crash the node from its
+// onApplied hook, which ends the batch.
 func (r *Run) applyCommitted(nd *simNode) {
-	for i := 0; i < applyBatch; i++ {
-		ci := nd.node.CommitIndex()
-		if nd.sm.applied >= ci {
-			return
-		}
-		s := nd.sm.applied + 1
-		e, ok := nd.node.Chosen(s)
+	for i := 0; i < applyBatch && nd.alive; i++ {
+		snap := r.checker.beforeApply(nd)
+		a, ok := nd.core.ApplyNext()
 		if !ok {
-			r.checker.fail(r, "S2", "node %d: commit index %d but slot %d is not chosen", nd.id, ci, s)
 			return
 		}
-		h := nd.sm.apply(e)
-		r.checker.observeApply(r, nd, e, h)
+		nd.applied = a.Slot
+		if a.NoOp {
+			r.tracef("node %d applied slot %d: no-op", nd.id, a.Slot)
+		} else {
+			r.tracef("node %d applied slot %d: %s(%s) -> %s replayed=%t", nd.id, a.Slot, describeOp(a), a.Key, a.Result.Code, a.Result.Replayed)
+		}
+		r.checker.observeApply(r, nd, a, snap)
+		if r.scenario != nil && r.scenario.onApplied != nil {
+			r.scenario.onApplied(r, nd, a)
+		}
 	}
+}
+
+func describeOp(a replica.Applied) string {
+	if a.Command.Op == nil {
+		return "?"
+	}
+	return fmt.Sprintf("%T", a.Command.Op)[len("tournament."):]
 }
 
 func (r *Run) handleEvent(ev event) {
@@ -383,7 +360,7 @@ func (r *Run) handleEvent(ev event) {
 		if !nd.alive || nd.gen != ev.gen {
 			return
 		}
-		r.callNode(nd, nil, func(now time.Duration) []replog.Envelope { return nd.node.Tick(now) })
+		r.callNode(nd, nil, func(now time.Duration) []replog.Envelope { return nd.core.Tick(now) })
 		if nd.alive && nd.gen == ev.gen {
 			r.schedule(event{at: r.clock + tickInterval, kind: evTick, node: ev.node, gen: ev.gen})
 		}
@@ -437,10 +414,10 @@ func (r *Run) RunFaultsContext(ctx context.Context) error {
 	return nil
 }
 
-// RunLiveness processes events after Heal until every client command is
-// chosen and every core node has applied through a common commit index, or
-// until LivenessSteps events have run. It then runs the checker's end-of-run
-// comparison. It returns a *Violation, a *LivenessError, or nil.
+// RunLiveness processes events after Heal until every client workflow has
+// completed and every core node has applied through a common commit index,
+// or until LivenessSteps events have run. It then runs the checker's
+// end-of-run comparison. It returns a *Violation, a *LivenessError, or nil.
 func (r *Run) RunLiveness() error { return r.RunLivenessContext(context.Background()) }
 
 // RunLivenessContext is RunLiveness with cancellation: it returns ctx.Err()
@@ -486,7 +463,7 @@ func (r *Run) Check() error {
 // run from completing instead of being masked.
 func (r *Run) complete() bool {
 	for _, c := range r.clients {
-		if c.cur != nil || len(c.todo) > 0 {
+		if !c.idle() {
 			return false
 		}
 	}
@@ -508,7 +485,7 @@ func (r *Run) complete() bool {
 		return false
 	}
 	for _, nd := range nodes {
-		if nd.node.Promised() != lb || nd.node.CommitIndex() != ci || nd.sm.applied != ci {
+		if nd.node.Promised() != lb || nd.node.CommitIndex() != ci || nd.core.State().Applied() != ci {
 			return false
 		}
 	}
@@ -543,20 +520,23 @@ func (r *Run) progress() string {
 	var b strings.Builder
 	pending := 0
 	for _, c := range r.clients {
-		if c.cur != nil || len(c.todo) > 0 {
+		if !c.idle() {
 			pending++
+			if c.pending != nil {
+				fmt.Fprintf(&b, " client %d waits on %s (step %s, %d attempts);", c.id, c.pending.key, c.wf.stepName(c.pending.step), c.pending.attempts)
+			}
 		}
 	}
-	fmt.Fprintf(&b, "%d of %d clients pending;", pending, len(r.clients))
+	fmt.Fprintf(&b, " %d of %d clients pending;", pending, len(r.clients))
 	for _, nd := range r.coreNodes() {
 		if !nd.alive {
 			fmt.Fprintf(&b, " node %d down;", nd.id)
 			continue
 		}
 		fmt.Fprintf(&b, " node %d %s commit %d applied %d promised %v;", nd.id, nd.node.Role(),
-			nd.node.CommitIndex(), nd.sm.applied, nd.node.Promised())
+			nd.node.CommitIndex(), nd.core.State().Applied(), nd.node.Promised())
 	}
-	return b.String()
+	return strings.TrimSpace(b.String())
 }
 
 // Report returns the counters so far.
@@ -566,8 +546,8 @@ func (r *Run) Report() Report {
 	rep.SimTime = r.clock
 	rep.Applied, rep.Commit = 0, 0
 	for _, nd := range r.nodes {
-		if nd.sm != nil && nd.sm.applied > rep.Applied {
-			rep.Applied = nd.sm.applied
+		if nd.applied > rep.Applied {
+			rep.Applied = nd.applied
 		}
 		if nd.alive && nd.node.CommitIndex() > rep.Commit {
 			rep.Commit = nd.node.CommitIndex()
@@ -579,6 +559,20 @@ func (r *Run) Report() Report {
 	rep.Issued = 0
 	for _, c := range r.clients {
 		rep.Issued += c.issued
+	}
+	c := r.checker
+	rep.Settled, rep.Voided = 0, 0
+	for _, s := range c.settled {
+		rep.Settled++
+		if s.voided {
+			rep.Voided++
+		}
+	}
+	rep.Keys = len(c.firstResult)
+	rep.Applies, rep.Replays, rep.KeyReused, rep.Rejections = c.applies, c.replays, c.keyReused, c.rejections
+	rep.Checks = make(map[string]int, len(c.checks))
+	for k, v := range c.checks {
+		rep.Checks[k] = v
 	}
 	marks := make(map[string]int, len(r.report.Marks))
 	for k, v := range r.report.Marks {
@@ -605,13 +599,13 @@ func describe(m replog.Message) string {
 	case replog.Promise:
 		return fmt.Sprintf("promise %v n=%d ci=%d", x.Ballot, len(x.Accepted), x.CommitIndex)
 	case replog.Accept:
-		return fmt.Sprintf("accept %v s=%d v=%q", x.Ballot, x.Slot, x.Value)
+		return fmt.Sprintf("accept %v s=%d v=%s", x.Ballot, x.Slot, describeValue(x.Value))
 	case replog.Accepted:
 		return fmt.Sprintf("accepted %v s=%d", x.Ballot, x.Slot)
 	case replog.Nack:
 		return fmt.Sprintf("nack %v promised=%v s=%d lease=%v", x.Ballot, x.Promised, x.Slot, x.LeaseRemaining)
 	case replog.Learn:
-		return fmt.Sprintf("learn s=%d %v v=%q", x.Slot, x.Ballot, x.Value)
+		return fmt.Sprintf("learn s=%d %v v=%s", x.Slot, x.Ballot, describeValue(x.Value))
 	case replog.LearnRequest:
 		return fmt.Sprintf("learn_request from=%d max=%d", x.FromSlot, x.MaxCount)
 	case replog.Heartbeat:

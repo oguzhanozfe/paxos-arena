@@ -45,7 +45,8 @@ func replay(p Params) string {
 }
 
 // runFull runs the fault phase, heals and runs the liveness phase, failing
-// the test with the replay command on any error.
+// the test with the replay command on any error, and checks the workload
+// bookkeeping every run must satisfy.
 func runFull(t *testing.T, p Params) Report {
 	t.Helper()
 	r, err := New(p, nil)
@@ -60,15 +61,36 @@ func runFull(t *testing.T, p Params) Report {
 		t.Fatalf("liveness phase: %v\nreplay: %s", err, replay(r.Params()))
 	}
 	rep := r.Report()
+	ep := r.Params()
 	if rep.Participants != rep.Nodes {
-		t.Fatalf("%d of %d nodes participated in the final round\nreplay: %s", rep.Participants, rep.Nodes, replay(r.Params()))
-	}
-	minIssued := r.Params().Clients * r.Params().commandsPerClient()
-	if rep.Issued < minIssued {
-		t.Fatalf("issued %d client commands, want at least %d\nreplay: %s", rep.Issued, minIssued, replay(r.Params()))
+		t.Fatalf("%d of %d nodes participated in the final round\nreplay: %s", rep.Participants, rep.Nodes, replay(ep))
 	}
 	if rep.Completed != rep.Issued {
-		t.Fatalf("completed %d of %d issued client commands\nreplay: %s", rep.Completed, rep.Issued, replay(r.Params()))
+		t.Fatalf("completed %d of %d issued client commands\nreplay: %s", rep.Completed, rep.Issued, replay(ep))
+	}
+	if rep.Unexpected != 0 {
+		t.Fatalf("%d unexpected results for workflow steps\nreplay: %s", rep.Unexpected, replay(ep))
+	}
+	if ep.Clients > 0 {
+		if want := ep.Clients * ep.tournamentsPerBatch(); rep.Settled < want {
+			t.Fatalf("settled %d tournaments, want at least %d\nreplay: %s", rep.Settled, want, replay(ep))
+		}
+		if rep.Marks["client.settled"] != rep.Settled {
+			t.Fatalf("clients saw %d settlements, checker saw %d settled tournaments\nreplay: %s", rep.Marks["client.settled"], rep.Settled, replay(ep))
+		}
+	}
+	for _, inv := range Invariants {
+		switch {
+		case ep.Clients == 0:
+			continue
+		case inv.ID == "S5" && rep.Crashes == 0:
+			continue // durability is checked at restarts only
+		case inv.ID == "S7" && rep.ReadsCompleted == 0:
+			continue // read barriers are checked when a read completes
+		}
+		if rep.Checks[inv.ID] == 0 {
+			t.Errorf("invariant %s was never evaluated\nreplay: %s", inv.ID, replay(ep))
+		}
 	}
 	return rep
 }
@@ -78,6 +100,19 @@ func runFull(t *testing.T, p Params) Report {
 func checkScenario(t *testing.T, name string, rep Report) {
 	t.Helper()
 	switch name {
+	case "leader_crash_mid_settlement":
+		if rep.Marks["mid_settlement.crashed"] != 1 {
+			t.Errorf("the leader was not crashed during settlement (variant %d, marks %v)", rep.Marks["mid_settlement.variant"], rep.Marks)
+		}
+		if rep.Settled != 1 || rep.Voided != 0 {
+			t.Errorf("settled %d (voided %d), want exactly one settled tournament", rep.Settled, rep.Voided)
+		}
+		if rep.Crashes < 1 {
+			t.Errorf("no crash recorded")
+		}
+		if v := rep.Marks["mid_settlement.variant"]; v != 0 && rep.Marks["mid_settlement.settle_slot"] == 0 {
+			t.Errorf("variant %d never saw the settle slot", v)
+		}
 	case "dueling_leaders":
 		if rep.Partitions < 1 {
 			t.Errorf("no duel was staged")
@@ -96,6 +131,16 @@ func checkScenario(t *testing.T, name string, rep Report) {
 		if rep.Net.Duplicated == 0 {
 			t.Errorf("no message was duplicated")
 		}
+	case "client_retry_storm":
+		if rep.ExtraRetries == 0 || rep.Mutated == 0 {
+			t.Errorf("retry storm sent %d extra retries, %d mutated", rep.ExtraRetries, rep.Mutated)
+		}
+		if rep.KeyReused == 0 {
+			t.Errorf("no mutated retry was answered key_reused")
+		}
+		if rep.Replays == 0 {
+			t.Errorf("no retry was answered from the results table")
+		}
 	case "crash_restart_storm":
 		if rep.Crashes < 1 {
 			t.Errorf("no node crashed")
@@ -105,6 +150,13 @@ func checkScenario(t *testing.T, name string, rep Report) {
 	case "late_learner":
 		if rep.Marks["late_learner.unblocked_at_commit"] == 0 {
 			t.Errorf("the late learner never missed %d slots: marks %v", lateLearnerSlots, rep.Marks)
+		}
+	case "exclusion_change_at_settle":
+		if rep.Marks["client.join_rejected_excluded"] == 0 {
+			t.Errorf("no entrant on the creation-time list was rejected at Join")
+		}
+		if rep.Marks["checker.withheld_payouts"] == 0 {
+			t.Errorf("no payout was withheld under the settlement-time list")
 		}
 	}
 	if rep.ReadsCompleted == 0 {
@@ -132,14 +184,17 @@ func TestRandom(t *testing.T) {
 	for seed := 1; seed <= randomSeeds(); seed++ {
 		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
 			t.Parallel()
-			runFull(t, DefaultParams(uint64(seed)))
+			rep := runFull(t, DefaultParams(uint64(seed)))
+			if rep.Voided == 0 && rep.Settled > 8 {
+				t.Logf("seed %d: %d settled tournaments and none voided", seed, rep.Settled)
+			}
 		})
 	}
 }
 
 // TestLivenessAfterHeal states its fairness assumption in its name: after
-// Heal stops every fault, every client command is chosen and every node
-// applies through one commit index within the liveness bound.
+// Heal stops every fault, every client workflow reaches Settled and every
+// node applies through one commit index within the liveness bound.
 func TestLivenessAfterHeal(t *testing.T) {
 	for seed := 1; seed <= 10; seed++ {
 		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
@@ -184,6 +239,9 @@ func TestLivenessWithFrozenMinority(t *testing.T) {
 			rep := r.Report()
 			if rep.Participants != len(core) {
 				t.Fatalf("%d of %d core nodes participated", rep.Participants, len(core))
+			}
+			if rep.Unexpected != 0 || rep.Completed != rep.Issued {
+				t.Fatalf("workload: %d unexpected, %d of %d completed", rep.Unexpected, rep.Completed, rep.Issued)
 			}
 		})
 	}
@@ -315,6 +373,7 @@ func TestParamsValidate(t *testing.T) {
 		{"negative steps", func(p *Params) { p.Steps = -1 }, true},
 		{"drop above one", func(p *Params) { p.Faults.DropP = 1.5 }, true},
 		{"negative crash", func(p *Params) { p.CrashP = -0.1 }, true},
+		{"retry above one", func(p *Params) { p.RetryP = 2 }, true},
 		{"max delay below min", func(p *Params) { p.Faults.MinDelay = time.Second }, true},
 		{"restart bounds reversed", func(p *Params) { p.RestartAfter = [2]time.Duration{time.Second, 0} }, true},
 		{"negative skew", func(p *Params) { p.ClockSkewMax = -time.Second }, true},
@@ -338,13 +397,37 @@ func TestParamsValidate(t *testing.T) {
 }
 
 func TestScenariosListed(t *testing.T) {
-	want := []string{"dueling_leaders", "partition_and_heal", "duplicated_and_reordered_messages",
-		"crash_restart_storm", "clock_skew", "late_learner"}
+	want := []string{"leader_crash_mid_settlement", "dueling_leaders", "partition_and_heal",
+		"duplicated_and_reordered_messages", "client_retry_storm", "crash_restart_storm", "clock_skew",
+		"late_learner", "exclusion_change_at_settle"}
 	if got := Scenarios(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("Scenarios() = %v, want %v", got, want)
 	}
 	if findScenario("nope") != nil {
 		t.Error("findScenario returned a scenario for an unknown name")
+	}
+	if len(Invariants) != 14 {
+		t.Errorf("Invariants lists %d entries, want S1-S8 and D1-D6", len(Invariants))
+	}
+}
+
+// TestMidSettlementVariantsAllCrash runs one seed per crash point of the
+// leader_crash_mid_settlement scenario and requires that the crash happened
+// at that point and the tournament still settled exactly once.
+func TestMidSettlementVariantsAllCrash(t *testing.T) {
+	for v := 0; v < midSettlementVariants; v++ {
+		t.Run(crashPoint(v), func(t *testing.T) {
+			t.Parallel()
+			p := DefaultParams(uint64(v))
+			p.Scenario = "leader_crash_mid_settlement"
+			rep := runFull(t, p)
+			checkScenario(t, "leader_crash_mid_settlement", rep)
+			if rep.Marks["mid_settlement.variant"] != v {
+				t.Errorf("variant %d ran as %d", v, rep.Marks["mid_settlement.variant"])
+			}
+			t.Logf("variant %d (%s): settle slot %d, %d crashes, %d elections, %d replays", v, crashPoint(v),
+				rep.Marks["mid_settlement.settle_slot"], rep.Crashes, rep.Elections, rep.Replays)
+		})
 	}
 }
 

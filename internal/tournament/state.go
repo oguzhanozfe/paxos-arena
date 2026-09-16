@@ -26,7 +26,17 @@ type State struct {
 	applied     paxos.Slot
 	hash        [32]byte
 	commands    int
+	mutations   uint64
 }
+
+// Mutations returns the number of applied commands that changed a
+// tournament record or the ledger: successful, non-replayed commands. A
+// checker uses it to prove that a replay, a rejection or a key_reused
+// answer changed nothing.
+func (s *State) Mutations() uint64 { return s.mutations }
+
+// Recorded returns the number of keys in the results table.
+func (s *State) Recorded() int { return len(s.results) }
 
 // New returns an empty state at applied slot 0.
 func New() *State {
@@ -155,6 +165,9 @@ func (s *State) execute(slot paxos.Slot, ballot paxos.Ballot, cmd Command) Resul
 		return Result{Code: InvalidOp, Detail: fmt.Sprintf("unknown op %T", cmd.Op), Slot: slot}
 	}
 	res.Slot = slot
+	if res.Code == OK {
+		s.mutations++
+	}
 	s.results[cmd.Key] = record{fingerprint: fp, result: res}
 	return res
 }
@@ -338,7 +351,8 @@ func (s *State) settle(slot paxos.Slot, ballot paxos.Ballot, op Settle) Result {
 func (s *State) mix(slot paxos.Slot, ballot paxos.Ballot, cmd Command, res Result, postingsBefore int) {
 	h := sha256.New()
 	h.Write(s.hash[:])
-	h.Write([]byte(fmt.Sprintf("slot:%d ballot:%s\n", slot, ballot)))
+	// The ballot is deliberately left out: see Tournament.Ballot.
+	h.Write([]byte(fmt.Sprintf("slot:%d\n", slot)))
 	if enc, err := Encode(cmd); err == nil {
 		h.Write(enc)
 	} else {
@@ -348,22 +362,36 @@ func (s *State) mix(slot paxos.Slot, ballot paxos.Ballot, cmd Command, res Resul
 	h.Write(mustMarshal(res))
 	h.Write([]byte{'\n'})
 	if t, ok := s.tournaments[TournamentOf(cmd.Op)]; ok {
-		h.Write(mustMarshal(t))
+		h.Write(EncodeTournament(*t))
 		h.Write([]byte{'\n'})
 	}
-	for _, p := range s.book.PostingsSince(postingsBefore) {
-		h.Write(mustMarshal(p))
-		h.Write([]byte{'\n'})
-	}
+	h.Write(EncodePostings(s.book.PostingsSince(postingsBefore)))
 	copy(s.hash[:], h.Sum(nil))
 }
 
-// EncodeTournament returns the canonical JSON of a tournament record. The
-// checker uses it to compare records across nodes and over time.
+// EncodeTournament returns the canonical JSON of the replicated part of a
+// tournament record: everything but Ballot, which is per-replica audit
+// metadata (two replicas may learn the same slot under different ballots
+// when a chosen value is re-proposed by a later leader). The hash chain and
+// the simulator's cross-replica comparisons use it.
 func EncodeTournament(t Tournament) []byte {
+	t.Ballot = paxos.Ballot{}
 	b, err := json.Marshal(t)
 	if err != nil {
 		panic("tournament: marshal record: " + err.Error())
 	}
 	return b
+}
+
+// EncodePostings returns the canonical JSON of the replicated part of a
+// list of postings, one per line, with Ballot cleared for the same reason
+// as in EncodeTournament.
+func EncodePostings(ps []ledger.Posting) []byte {
+	var out []byte
+	for _, p := range ps {
+		p.Ballot = paxos.Ballot{}
+		out = append(out, mustMarshal(p)...)
+		out = append(out, '\n')
+	}
+	return out
 }

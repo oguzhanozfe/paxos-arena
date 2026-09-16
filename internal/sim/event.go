@@ -69,10 +69,10 @@ func (h *eventHeap) Pop() any {
 }
 
 // Violation is a safety invariant failure found by the Checker. Invariant is
-// the design's identifier (S1 through S7). Its Error string carries the seed,
-// step and scenario needed to replay the run.
+// the design's identifier (S1 through S8, D1 through D6). Its Error string
+// carries the seed, step and scenario needed to replay the run.
 type Violation struct {
-	// Invariant is the design's identifier, S1 through S7.
+	// Invariant is the design's identifier, S1 through S8 or D1 through D6.
 	Invariant string
 	// Detail says which node, slot or ballot broke the rule.
 	Detail string

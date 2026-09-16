@@ -141,13 +141,20 @@ func (s *Server) stamp(next http.Handler) http.Handler {
 // Problem is the RFC 9457 error body. Code is the machine-readable reason:
 // a tournament.Code for state-machine rejections, or one of the API codes.
 type Problem struct {
-	Type     string       `json:"type"`
-	Title    string       `json:"title"`
-	Status   int          `json:"status"`
-	Detail   string       `json:"detail,omitempty"`
-	Code     string       `json:"code"`
-	Replayed bool         `json:"replayed,omitempty"`
-	Leader   paxos.NodeID `json:"leader,omitempty"`
+	// Type is the problem type URI; always "about:blank" here.
+	Type string `json:"type"`
+	// Title is the HTTP status text.
+	Title string `json:"title"`
+	// Status is the HTTP status code.
+	Status int `json:"status"`
+	// Detail explains this occurrence.
+	Detail string `json:"detail,omitempty"`
+	// Code is the machine-readable reason.
+	Code string `json:"code"`
+	// Replayed is true when a rejection came from the results table.
+	Replayed bool `json:"replayed,omitempty"`
+	// Leader names the leader this replica knows, on not_leader problems.
+	Leader paxos.NodeID `json:"leader,omitempty"`
 }
 
 // API error codes, beyond the tournament codes.
@@ -187,31 +194,44 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 // CommandResponse is the success body of every POST.
 type CommandResponse struct {
-	Code       tournament.Code        `json:"code"`
-	Replayed   bool                   `json:"replayed"`
-	Slot       paxos.Slot             `json:"slot"`
-	Seed       uint64                 `json:"seed,omitempty"`
+	// Code is always "ok" in a success body.
+	Code tournament.Code `json:"code"`
+	// Replayed is true when the result came from the results table.
+	Replayed bool `json:"replayed"`
+	// Slot is the log slot of the command that produced the result.
+	Slot paxos.Slot `json:"slot"`
+	// Seed is the deal to play, set on Join results.
+	Seed uint64 `json:"seed,omitempty"`
+	// Tournament is the record after the command, as this replica holds it.
 	Tournament *tournament.Tournament `json:"tournament,omitempty"`
 }
 
 // TournamentResponse is the body of GET /v1/tournaments/{id}.
 type TournamentResponse struct {
-	Tournament  tournament.Tournament `json:"tournament"`
-	AppliedSlot paxos.Slot            `json:"applied_slot"`
-	Consistent  bool                  `json:"consistent"`
+	// Tournament is the record.
+	Tournament tournament.Tournament `json:"tournament"`
+	// AppliedSlot is how far the answering replica had applied the log.
+	AppliedSlot paxos.Slot `json:"applied_slot"`
+	// Consistent is false for a ?read=stale read.
+	Consistent bool `json:"consistent"`
 }
 
 // LedgerResponse is the body of GET /v1/tournaments/{id}/ledger.
 type LedgerResponse struct {
-	Tournament  tournament.TournamentID `json:"tournament"`
-	Postings    []ledger.Posting        `json:"postings"`
-	AppliedSlot paxos.Slot              `json:"applied_slot"`
-	Consistent  bool                    `json:"consistent"`
+	// Tournament is the tournament the postings belong to.
+	Tournament tournament.TournamentID `json:"tournament"`
+	// Postings are the tournament's postings in ledger order.
+	Postings []ledger.Posting `json:"postings"`
+	// AppliedSlot is how far the answering replica had applied the log.
+	AppliedSlot paxos.Slot `json:"applied_slot"`
+	// Consistent is false for a ?read=stale read.
+	Consistent bool `json:"consistent"`
 }
 
 // NodeResponse is the body of GET /v1/node.
 type NodeResponse struct {
 	replica.Status
+	// Peers maps every node to its base URL.
 	Peers map[paxos.NodeID]string `json:"peers"`
 }
 
