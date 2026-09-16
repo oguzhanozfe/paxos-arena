@@ -1,0 +1,19 @@
+# Binaries from `go build ./cmd/...` at the module root and from `make build`.
+/arena
+/chaos
+/bin/
+
+# Test, profile and trace output.
+*.test
+*.prof
+*.pprof
+*.trace
+/coverage.out
+/coverage.html
+
+# Editor and operating system files.
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

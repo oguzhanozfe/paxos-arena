@@ -1,7 +1,9 @@
 # Design: a replicated settlement log for paid card-game tournaments
 
 Status: design, written 2026-09-16. This document is the specification the
-implementation follows. It supersedes the draft problem statement in
+implementation follows. Where the implementation deviates from a paragraph
+below, the deviation is recorded in `docs/adr/` and the ADR takes precedence;
+`docs/README.md` lists them. It supersedes the draft problem statement in
 `docs/research/domain.md` section 9. Protocol claims rest on the sources
 collected in `docs/research/consensus.md`; Go conventions follow
 `docs/research/go-practice.md`. Neither research note is repeated here beyond

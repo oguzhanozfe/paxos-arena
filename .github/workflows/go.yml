@@ -1,0 +1,47 @@
+name: go
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: go-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Never download a newer toolchain; fail instead. go.mod says go 1.26.0,
+  # so both matrix entries must build it as is.
+  GOTOOLCHAIN: local
+
+jobs:
+  check:
+    name: go ${{ matrix.go }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest supported release line and the current one.
+        go: ["1.26.x", "1.27.x"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ matrix.go }}
+          # There is no go.sum (no dependencies); key the cache on go.mod.
+          cache-dependency-path: go.mod
+      - run: go version
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: go vet
+        run: go vet ./...
+      - name: go build
+        run: go build ./...
+      - name: go mod tidy is a no-op
+        run: go mod tidy -diff
+      - name: go test -race
+        run: go test -race -count=1 -shuffle=on -timeout 20m ./...
