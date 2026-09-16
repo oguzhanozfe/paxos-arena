@@ -1,0 +1,16 @@
+{
+    "name": "PaxosArena.Client.Unity",
+    "rootNamespace": "PaxosArena.Client.Unity",
+    "references": [
+        "PaxosArena.Client.Core"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

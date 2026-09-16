@@ -1,0 +1,8 @@
+# Build output of the dotnet harness and the compile checks under Tests~.
+bin/
+obj/
+
+# The repository ignores names ending in "~"; the package needs these two,
+# which the Unity editor itself skips.
+!Samples~/
+!Tests~/

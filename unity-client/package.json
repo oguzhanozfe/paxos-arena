@@ -1,0 +1,19 @@
+{
+  "name": "com.paxosarena.client",
+  "version": "0.1.0",
+  "displayName": "Paxos Arena Client",
+  "description": "Client for the paxos-arena play API: device sessions, idempotent sequenced intents that survive pause and restart, leader redirects and event long-polling.",
+  "unity": "2022.3",
+  "license": "MIT",
+  "dependencies": {
+    "com.unity.modules.jsonserialize": "1.0.0",
+    "com.unity.modules.unitywebrequest": "1.0.0"
+  },
+  "samples": [
+    {
+      "displayName": "Arena Sample",
+      "description": "One MonoBehaviour that opens a session, joins, deals, plays, finishes, reads the leaderboard and claims a payout.",
+      "path": "Samples~/ArenaSample"
+    }
+  ]
+}

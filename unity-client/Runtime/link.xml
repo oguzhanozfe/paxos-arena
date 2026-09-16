@@ -1,0 +1,4 @@
+<linker>
+  <assembly fullname="PaxosArena.Client.Core" preserve="all"/>
+  <assembly fullname="PaxosArena.Client.Unity" preserve="all"/>
+</linker>
