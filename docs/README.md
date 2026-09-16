@@ -53,6 +53,7 @@ the design. Each has context, decision and consequences.
 | [0011](adr/0011-file-store-for-per-process-replicas.md) | Per-process replicas keep their log state in an append-only file, required by `arena -peers`. |
 | [0012](adr/0012-bounds-on-commands.md) | Identifier shape, list and value size bounds, a bounded proposal queue, and forgetting abandoned requests. |
 | [0013](adr/0013-api-and-naming-corrections.md) | Smaller API, concurrency and naming corrections after review. |
+| [0014](adr/0014-reads-off-the-event-loop.md) | Reads run on the caller's goroutine, never on the event loop; open events polls share one scan per applied slot and are bounded. |
 
 ## `research/`
 

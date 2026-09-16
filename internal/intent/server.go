@@ -79,6 +79,9 @@ func New(cfg Config, b Backend, log *slog.Logger) (*Server, error) {
 	if cfg.MinSlotWait <= 0 {
 		cfg.MinSlotWait = DefaultMinSlotWait
 	}
+	if cfg.MaxEventPolls <= 0 {
+		cfg.MaxEventPolls = DefaultMaxEventPolls
+	}
 	if cfg.Limits == (Limits{}) {
 		cfg.Limits = DefaultLimits
 	}

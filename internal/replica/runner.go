@@ -41,16 +41,14 @@ type waiter struct {
 	abandoned atomic.Bool
 }
 
-// readReq is one Read. abandoned is set by Read when its context ends, so
-// the event loop skips fn. fn may still be running, or run later, when Read
-// has already returned ctx.Err(): a caller must not use anything fn writes
-// unless Read returned nil.
+// readReq is one consistent Read waiting for its read-index barrier. The
+// event loop answers nil once the applied slot reaches index, and the caller
+// then runs its function itself. abandoned is set by Read when its context
+// ends, so the event loop can forget the request.
 type readReq struct {
-	consistent bool
-	fn         func(*tournament.State) error
-	reply      chan error
-	index      paxos.Slot
-	abandoned  atomic.Bool
+	reply     chan error
+	index     paxos.Slot
+	abandoned atomic.Bool
 }
 
 // Runner is the one goroutine per process that owns a Core. Transport
@@ -76,6 +74,21 @@ type Runner struct {
 	applyWaits   []*readReq
 	held         atomic.Int64 // requests held, as of the last event
 
+	// stateMu keeps reads off the event loop. Read runs its function on the
+	// caller's goroutine holding stateMu for reading. The event loop, the
+	// only writer of the state machine, applies chosen slots holding it for
+	// writing, and takes it only with TryLock, so no read ever blocks the
+	// loop: while reads are in progress it leaves the slots committed but
+	// unapplied and keeps stepping the log. applyWait is non-nil while such
+	// an apply waits; new reads wait for it to close instead of starting,
+	// and every read that ends while it is set sends on kick, so the loop
+	// retries as soon as the reads in progress have ended. The loop's own
+	// reads of the state need no lock.
+	stateMu   sync.RWMutex
+	waitMu    sync.Mutex
+	applyWait chan struct{} // guarded by waitMu
+	kick      chan struct{}
+
 	mu     sync.RWMutex
 	status Status
 	// advanced is closed, and replaced, whenever the status snapshot's
@@ -98,6 +111,7 @@ func NewRunner(core *Core, send func(replog.Envelope), log *slog.Logger) *Runner
 		submits:      make(chan *waiter),
 		reads:        make(chan *readReq),
 		done:         make(chan struct{}),
+		kick:         make(chan struct{}, 1),
 		advanced:     make(chan struct{}),
 		waiters:      make(map[tournament.IdempotencyKey][]*waiter),
 		pendingReads: make(map[uint64]*readReq),
@@ -136,6 +150,8 @@ func (r *Runner) Run(ctx context.Context) error {
 			r.handleSubmit(req)
 		case req := <-r.reads:
 			r.handleRead(req)
+		case <-r.kick:
+			r.after(nil)
 		}
 		if err := r.core.Failed(); err != nil {
 			r.log.Error("core failed", "err", err)
@@ -184,32 +200,94 @@ func (r *Runner) Submit(ctx context.Context, cmd tournament.Command) (tournament
 	}
 }
 
-// Read runs fn on the event-loop goroutine against the state machine. With
-// consistent set, it first runs the read-index barrier on the leader and
-// waits until the applied slot reaches the index, so fn sees every command
-// completed before Read was called; it returns replog.NotLeaderError or
-// replog.ErrNotReady when the barrier cannot start. Without it, fn runs at
-// once on whatever this replica has applied. fn must not retain the state.
+// Read runs fn against the state machine on the caller's goroutine, never
+// on the event loop, so no read, however slow, delays heartbeats, elections
+// or the log. fn sees the state between two applied slots. While fn runs,
+// the event loop defers applying newly chosen slots, and reads that start
+// meanwhile wait until those slots are applied, so a slow read delays the
+// answers to commands, not consensus. With consistent set, Read first runs
+// the read-index barrier on the leader and waits until the applied slot
+// reaches the index, so fn sees every command completed before Read was
+// called; it returns replog.NotLeaderError or replog.ErrNotReady when the
+// barrier cannot start. Without it, fn runs at once on whatever this
+// replica has applied. fn must not retain the state or modify it.
 //
-// When ctx ends first, Read returns ctx.Err() at once. fn may be running on
-// the event loop at that moment, or start later, so the caller must not use
-// anything fn writes unless Read returned nil; nil is returned only after fn
-// has returned.
+// When ctx ends before fn starts, Read returns ctx.Err() and fn never runs;
+// once fn has started, Read returns what fn returns. It returns ErrStopped
+// once Run has returned.
 func (r *Runner) Read(ctx context.Context, consistent bool, fn func(*tournament.State) error) error {
-	req := &readReq{consistent: consistent, fn: fn, reply: make(chan error, 1)}
-	select {
-	case r.reads <- req:
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-r.done:
-		return ErrStopped
+	if consistent {
+		req := &readReq{reply: make(chan error, 1)}
+		select {
+		case r.reads <- req:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-r.done:
+			return ErrStopped
+		}
+		select {
+		case err := <-req.reply:
+			if err != nil {
+				return err
+			}
+		case <-ctx.Done():
+			req.abandoned.Store(true)
+			return ctx.Err()
+		}
+	} else {
+		select {
+		case <-r.done:
+			return ErrStopped
+		default:
+		}
 	}
-	select {
-	case err := <-req.reply:
+	if err := ctx.Err(); err != nil {
 		return err
-	case <-ctx.Done():
-		req.abandoned.Store(true)
-		return ctx.Err()
+	}
+	return r.readState(ctx, fn)
+}
+
+// readState runs fn holding stateMu for reading, after any apply the event
+// loop is waiting to make.
+func (r *Runner) readState(ctx context.Context, fn func(*tournament.State) error) error {
+	for {
+		r.stateMu.RLock()
+		wait := r.pendingApply()
+		if wait == nil {
+			break
+		}
+		r.stateMu.RUnlock()
+		r.nudge()
+		select {
+		case <-wait:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-r.done:
+			return ErrStopped
+		}
+	}
+	defer func() {
+		r.stateMu.RUnlock()
+		if r.pendingApply() != nil {
+			r.nudge()
+		}
+	}()
+	return fn(r.core.State())
+}
+
+// pendingApply returns the channel that closes when the apply the event
+// loop is waiting to make is done, or nil when it waits for none.
+func (r *Runner) pendingApply() chan struct{} {
+	r.waitMu.Lock()
+	defer r.waitMu.Unlock()
+	return r.applyWait
+}
+
+// nudge asks the event loop to retry a deferred apply.
+func (r *Runner) nudge() {
+	select {
+	case r.kick <- struct{}{}:
+	default:
 	}
 }
 
@@ -266,12 +344,9 @@ func (r *Runner) handleSubmit(w *waiter) {
 	r.after(outs)
 }
 
+// handleRead starts the read-index barrier of a consistent Read.
 func (r *Runner) handleRead(req *readReq) {
 	if req.abandoned.Load() {
-		return
-	}
-	if !req.consistent {
-		req.reply <- req.fn(r.core.State())
 		return
 	}
 	seq, outs, err := r.core.ReadIndex(r.now())
@@ -361,7 +436,7 @@ func (r *Runner) after(outs []replog.Envelope) {
 				"have", e.Have.Ballot.String(), "got", e.Got.Ballot.String())
 		}
 	}
-	applied := r.core.ApplyCommitted()
+	applied := r.applyCommitted()
 
 	st := r.core.Status()
 	r.mu.Lock()
@@ -420,7 +495,7 @@ func (r *Runner) after(outs []replog.Envelope) {
 			switch {
 			case rq.abandoned.Load():
 			case st.Applied >= rq.index:
-				rq.reply <- rq.fn(r.core.State())
+				rq.reply <- nil
 			default:
 				kept = append(kept, rq)
 			}
@@ -429,6 +504,35 @@ func (r *Runner) after(outs []replog.Envelope) {
 		r.applyWaits = kept
 	}
 	r.held.Store(int64(r.nwaiters + len(r.pendingReads) + len(r.applyWaits)))
+}
+
+// applyCommitted applies every chosen slot up to the commit index, holding
+// stateMu for writing. It marks the apply as waiting before it tries the
+// lock, so that no new read starts and every read in progress, which must
+// have taken the lock after the mark, nudges the loop when it ends. When
+// reads hold stateMu it applies nothing and returns, leaving the mark; the
+// loop retries on the nudge, and at every event and tick.
+func (r *Runner) applyCommitted() []Applied {
+	if r.core.Log().CommitIndex() <= r.core.State().Applied() {
+		return nil
+	}
+	r.waitMu.Lock()
+	if r.applyWait == nil {
+		r.applyWait = make(chan struct{})
+	}
+	r.waitMu.Unlock()
+	if !r.stateMu.TryLock() {
+		return nil
+	}
+	applied := r.core.ApplyCommitted()
+	r.stateMu.Unlock()
+	r.waitMu.Lock()
+	if r.applyWait != nil {
+		close(r.applyWait)
+		r.applyWait = nil
+	}
+	r.waitMu.Unlock()
+	return applied
 }
 
 // failAll answers every pending request with err.

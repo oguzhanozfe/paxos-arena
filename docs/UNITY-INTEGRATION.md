@@ -802,7 +802,10 @@ leader, the leader's buckets bound writes.
 | event-polls | player | 1 per 500 ms | 4 | events |
 
 A player has at most one open events request per replica: a new one ends the
-previous one at once with `200` and no events. The client IP address is the
+previous one at once with `200` and no events. A replica holds at most
+10 000 open events requests (`intent.Config.MaxEventPolls`); one more, from
+a player without an open request there, answers `503 unavailable` with
+`Retry-After`, and the client retries it like any retryable answer. The client IP address is the
 TCP peer's, or the first `X-Forwarded-For` address when the peer is listed in
 `-play-trusted-proxies`. Over a limit the answer is `429 rate_limited` with
 `Retry-After` set to the seconds until a token is available; nothing is
@@ -1300,7 +1303,12 @@ Semantics:
    valid on any other.
 
 Errors: `400 malformed_request`, `401`, `404` `unknown_tournament` or
-`not_joined` for `tournament_id`, `429`.
+`not_joined` for `tournament_id`, `429`, `503 unavailable` when the replica
+holds its bound of open events requests (7.1.6).
+
+The open requests of a replica share the work of waiting: each applied slot
+costs one scan of every open request's cursor, and a request reads its
+events only when that scan finds some (ADR 0014).
 
 ### 7.4 Error codes
 
@@ -1672,7 +1680,11 @@ the same packages: `game.Card.Suit`, `Card.Valid`, `Board.Clone` and
 `State.EventCount` and `ClaimableAmount`; `intent.BuildRoundViewAt`, the
 view as of a result with the move count its outcome recorded, which
 `BuildRoundView` calls with every accepted move; `intent.RandomPlayerID`,
-`intent.NoLimits` and `intent.Config.TrustedProxies`.
+`intent.NoLimits`, `intent.Config.TrustedProxies` and
+`intent.Config.MaxEventPolls`; `tournament.State.HasEvents`, whether `Events`
+would return anything, without building the events. `replica.Runner.Read`
+runs its function on the caller's goroutine, never on the event loop
+(ADR 0014).
 
 ```go
 package game

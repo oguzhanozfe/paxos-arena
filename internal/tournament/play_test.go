@@ -840,6 +840,18 @@ func TestEventsPaging(t *testing.T) {
 	if d.s.Events(0, "", "ghost", 0) != nil {
 		t.Error("unknown player sees events")
 	}
+	// HasEvents answers what Events with max 1 would, for every cursor,
+	// filter and player.
+	last := all[len(all)-1].Slot
+	for after := paxos.Slot(0); after <= last+1; after++ {
+		for _, filter := range []TournamentID{"", "t", "u", "v"} {
+			for _, p := range []PlayerID{pid(0), pid(1), "ghost"} {
+				if got, want := d.s.HasEvents(after, filter, p), len(d.s.Events(after, filter, p, 1)) > 0; got != want {
+					t.Errorf("HasEvents(%d, %q, %s) = %v, Events says %v", after, filter, p, got, want)
+				}
+			}
+		}
+	}
 }
 
 // playCorpus is one command per play op, for codec round trips and fuzz

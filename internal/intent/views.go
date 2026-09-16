@@ -128,66 +128,96 @@ func tournamentSummary(st *tournament.State, h tournament.Header, p tournament.P
 	return s
 }
 
-// leaderboard builds the rows of play tournament t in place order, and
+// leaderboard builds every row of play tournament t in place order, and
 // player p's own row.
 func leaderboard(st *tournament.State, t tournament.Tournament, p tournament.PlayerID) ([]LeaderboardRow, LeaderboardRow) {
+	return leaderboardPage(st, t, p, 0, int64(len(t.Entries)))
+}
+
+// leaderboardPage builds the rows of play tournament t at places offset+1
+// to offset+limit, and player p's own row (zero when p has no entry). It
+// ranks every entry once, in O(n log n) with a few map lookups per entry,
+// and builds the rows it returns only, so a page costs O(n log n + limit)
+// whatever the size of the tournament.
+func leaderboardPage(st *tournament.State, t tournament.Tournament, p tournament.PlayerID, offset, limit int64) ([]LeaderboardRow, LeaderboardRow) {
 	book := st.Ledger()
 	tid := string(t.ID)
-	row := func(pid tournament.PlayerID) LeaderboardRow {
-		prog := st.Progress(t.ID, pid)
-		r := LeaderboardRow{PlayerID: string(pid), TotalScore: prog.Total, RoundsFinished: int32(prog.Finished),
-			Claimed: book.Has(ledger.ClaimKey(tid, string(pid)))}
-		if e, ok := t.Entry(pid); ok {
-			r.Scored = e.Scored
-		}
-		for _, po := range t.Payouts {
-			if po.Player == pid {
-				r.Amount += int64(po.Amount)
-				r.Withheld = r.Withheld || po.Withheld
-			}
-		}
-		return r
+	// ranked is one entrant in place order: the entry's index, and for an
+	// open tournament the progress the ranking uses.
+	type ranked struct {
+		player   tournament.PlayerID
+		entry    int
+		standing int
+		prog     tournament.EntryProgress
+		join     uint32
 	}
-	rows := make([]LeaderboardRow, 0, len(t.Entries))
-	if t.Status == tournament.Open {
-		type ranked struct {
-			row     LeaderboardRow
-			reached paxos.Slot
-			join    uint32
+	var payouts map[tournament.PlayerID][]int
+	if len(t.Payouts) > 0 {
+		payouts = make(map[tournament.PlayerID][]int, len(t.Payouts))
+		for i, po := range t.Payouts {
+			payouts[po.Player] = append(payouts[po.Player], i)
 		}
-		rs := make([]ranked, 0, len(t.Entries))
-		for _, e := range t.Entries {
-			rs = append(rs, ranked{row: row(e.Player.ID), reached: st.Progress(t.ID, e.Player.ID).ReachedAt, join: e.JoinSeq})
+	}
+	rs := make([]ranked, 0, len(t.Entries))
+	if t.Status == tournament.Open {
+		for i, e := range t.Entries {
+			rs = append(rs, ranked{player: e.Player.ID, entry: i, standing: -1, prog: st.Progress(t.ID, e.Player.ID), join: e.JoinSeq})
 		}
 		sort.SliceStable(rs, func(i, j int) bool {
-			a, b := rs[i], rs[j]
+			a, b := &rs[i], &rs[j]
 			switch {
-			case a.row.TotalScore != b.row.TotalScore:
-				return a.row.TotalScore > b.row.TotalScore
-			case a.row.RoundsFinished != b.row.RoundsFinished:
-				return a.row.RoundsFinished > b.row.RoundsFinished
-			case a.reached != b.reached:
-				return a.reached < b.reached
+			case a.prog.Total != b.prog.Total:
+				return a.prog.Total > b.prog.Total
+			case a.prog.Finished != b.prog.Finished:
+				return a.prog.Finished > b.prog.Finished
+			case a.prog.ReachedAt != b.prog.ReachedAt:
+				return a.prog.ReachedAt < b.prog.ReachedAt
 			}
 			return a.join < b.join
 		})
-		for i, r := range rs {
-			r.row.Place = int32(i + 1)
-			rows = append(rows, r.row)
-		}
 	} else {
-		for _, sd := range t.Standings {
-			r := row(sd.Player)
-			r.Place = int32(sd.Place)
-			r.TotalScore = sd.Score
-			r.Scored = sd.Scored
-			rows = append(rows, r)
+		for i, sd := range t.Standings {
+			rs = append(rs, ranked{player: sd.Player, entry: -1, standing: i})
+		}
+	}
+	row := func(place int, r ranked) LeaderboardRow {
+		prog := r.prog
+		if r.standing >= 0 {
+			prog = st.Progress(t.ID, r.player)
+		}
+		out := LeaderboardRow{Place: int32(place), PlayerID: string(r.player), TotalScore: prog.Total, RoundsFinished: int32(prog.Finished),
+			Claimed: book.Has(ledger.ClaimKey(tid, string(r.player)))}
+		if r.entry >= 0 {
+			out.Scored = t.Entries[r.entry].Scored
+		}
+		if r.standing >= 0 {
+			sd := t.Standings[r.standing]
+			out.Place = int32(sd.Place)
+			out.TotalScore = sd.Score
+			out.Scored = sd.Scored
+		}
+		for _, i := range payouts[r.player] {
+			out.Amount += int64(t.Payouts[i].Amount)
+			out.Withheld = out.Withheld || t.Payouts[i].Withheld
+		}
+		return out
+	}
+	rows := []LeaderboardRow{}
+	if offset < int64(len(rs)) {
+		end := int64(len(rs))
+		if limit < end-offset {
+			end = offset + limit
+		}
+		rows = make([]LeaderboardRow, 0, end-offset)
+		for i := offset; i < end; i++ {
+			rows = append(rows, row(int(i)+1, rs[i]))
 		}
 	}
 	me := LeaderboardRow{}
-	for _, r := range rows {
-		if r.PlayerID == string(p) {
-			me = r
+	for i := len(rs) - 1; i >= 0; i-- {
+		if rs[i].player == p {
+			me = row(i+1, rs[i])
+			break
 		}
 	}
 	return rows, me

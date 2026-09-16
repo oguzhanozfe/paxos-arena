@@ -117,6 +117,10 @@ type Config struct {
 	// TrustedProxies lists the peers whose first X-Forwarded-For address is
 	// taken as the client's address for the session-address rate limit.
 	TrustedProxies []netip.Addr
+	// MaxEventPolls bounds the events requests open at once on this replica,
+	// one per player; a request beyond it answers 503 unavailable. Default
+	// DefaultMaxEventPolls.
+	MaxEventPolls int
 }
 
 // Server holds the play API's handlers.
@@ -137,6 +141,9 @@ type Server struct {
 	inflight map[tournament.IdempotencyKey]struct{}
 	// polls holds each player's open events request on this replica.
 	polls map[tournament.PlayerID]*poll
+	// scanning is closed when the scan of open events requests in progress
+	// ends; nil when none runs.
+	scanning chan struct{}
 }
 
 // Routes, as net/http patterns.
@@ -218,6 +225,8 @@ const (
 	MaxEventsWait = 25 * time.Second
 	// MaxEventsPerResponse bounds the events of one response.
 	MaxEventsPerResponse = 100
+	// DefaultMaxEventPolls is the default of Config.MaxEventPolls.
+	DefaultMaxEventPolls = 10000
 	// DefaultPageLimit is the page size of a list without limit.
 	DefaultPageLimit = 50
 	// MaxPageLimit bounds limit.

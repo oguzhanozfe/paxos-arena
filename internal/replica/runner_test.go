@@ -354,3 +354,100 @@ func TestAbandonedSubmitsAreForgotten(t *testing.T) {
 		}
 	})
 }
+
+// TestSlowReadDoesNotStallTheEventLoop: a read runs on its caller's
+// goroutine, so a read that does not return keeps neither heartbeats nor
+// the log from making progress. Before reads left the event loop, a read
+// function that blocked stopped the leader's heartbeats and the followers
+// elected a new leader within an election timeout. While the read runs the
+// leader leaves a chosen command unapplied, a read that starts meanwhile
+// waits for that apply, and both complete once the slow read returns.
+func TestSlowReadDoesNotStallTheEventLoop(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		peers := []paxos.NodeID{1, 2, 3}
+		c := newCluster(t)
+		defer c.stop()
+		rs := []*Runner{
+			c.add(replog.DefaultConfig(1, peers), replog.NewMemStore()),
+			c.add(replog.DefaultConfig(2, peers), replog.NewMemStore()),
+			c.add(replog.DefaultConfig(3, peers), replog.NewMemStore()),
+		}
+		var leader *Runner
+		waitFor(t, func() bool {
+			for _, r := range rs {
+				if r.Status().Ready {
+					leader = r
+					return true
+				}
+			}
+			return false
+		}, "a ready leader")
+		ballot := leader.Status().Ballot
+
+		release := make(chan struct{})
+		slow := make(chan error, 1)
+		entered := make(chan struct{})
+		go func() {
+			slow <- leader.Read(context.Background(), false, func(*tournament.State) error {
+				close(entered)
+				<-release
+				return nil
+			})
+		}()
+		<-entered
+
+		submitted := make(chan error, 1)
+		go func() {
+			res, err := leader.Submit(context.Background(), createCmd("k-slow", "t-slow"))
+			if err == nil && res.Code != tournament.OK {
+				err = fmt.Errorf("result %s", res.Code)
+			}
+			submitted <- err
+		}()
+		waitFor(t, func() bool {
+			st := leader.Status()
+			return st.CommitIndex > st.Applied
+		}, "the command to be chosen while the read runs")
+
+		later := make(chan bool, 1)
+		go func() {
+			var seen bool
+			leader.Read(context.Background(), false, func(s *tournament.State) error {
+				_, seen = s.Tournament("t-slow")
+				return nil
+			})
+			later <- seen
+		}()
+
+		// Ten election timeouts with the read still running.
+		time.Sleep(3 * time.Second)
+		synctest.Wait()
+		for _, r := range rs {
+			if st := r.Status(); st.Ballot != ballot || st.Leader != leader.Status().Self {
+				t.Fatalf("node %d: ballot %s leader %d, want %s and node %d: the slow read stopped the heartbeats",
+					st.Self, st.Ballot, st.Leader, ballot, leader.Status().Self)
+			}
+		}
+		select {
+		case err := <-submitted:
+			t.Fatalf("Submit answered before its slot could be applied: %v", err)
+		case <-later:
+			t.Fatal("a read started while an apply was deferred ran before the apply")
+		default:
+		}
+
+		close(release)
+		if err := <-slow; err != nil {
+			t.Fatalf("slow read = %v", err)
+		}
+		if err := <-submitted; err != nil {
+			t.Fatalf("Submit after the read = %v", err)
+		}
+		if !<-later {
+			t.Error("the read that waited for the deferred apply did not see the command")
+		}
+		if st := leader.Status(); st.Applied != st.CommitIndex {
+			t.Errorf("after the read: applied %d, commit %d", st.Applied, st.CommitIndex)
+		}
+	})
+}

@@ -279,6 +279,45 @@ func (s *State) Events(after paxos.Slot, t TournamentID, p PlayerID, max int) []
 	return out
 }
 
+// HasEvents reports whether Events(after, t, p, 1) returns any event,
+// without building them: the check an events long-poll repeats for every
+// open request as slots are applied.
+func (s *State) HasEvents(after paxos.Slot, t TournamentID, p PlayerID) bool {
+	ps, ok := s.play.players[p]
+	if !ok {
+		return false
+	}
+	own := s.play.own[p]
+	for i := s.firstAfter(own, after); i < len(own); i++ {
+		if t == "" || s.play.events[own[i]].Tournament == t {
+			return true
+		}
+	}
+	for _, tid := range ps.entered {
+		if t == "" || tid == t {
+			if list := s.play.shared[tid]; s.firstAfter(list, after) < len(list) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// firstAfter returns the position in list, an ascending index of events,
+// of the first event whose slot is above after.
+func (s *State) firstAfter(list []int, after paxos.Slot) int {
+	lo, hi := 0, len(list)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if s.play.events[list[mid]].Slot > after {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	return lo
+}
+
 // EventCount returns the number of events recorded.
 func (s *State) EventCount() int { return len(s.play.events) }
 

@@ -784,10 +784,12 @@ the leader, `replog.ErrBusy` when the leader's queue is full, and
 it was applied. A pending `Submit` is answered with the result of the applied
 command only when the fingerprints match; otherwise with `key_reused`.
 `Read` with `consistent=true` runs the read-index barrier of section 3.5 and
-then executes `fn` on the event-loop goroutine; with `consistent=false` it
-executes `fn` immediately on that goroutine. When the context ends first,
-`Read` returns at once while `fn` may still run, so a caller uses what `fn`
-wrote only when `Read` returned nil. The runner refreshes `Status` before it
+then executes `fn`; with `consistent=false` it executes `fn` at once. `fn`
+runs on the caller's goroutine under a read lock, never on the event loop,
+which applies chosen slots only when no read holds the lock and keeps
+stepping the log meanwhile ([ADR 0014](adr/0014-reads-off-the-event-loop.md)).
+When the context ends before `fn` starts, `Read` returns the context's error
+and `fn` never runs. The runner refreshes `Status` before it
 answers any request an event completed, so a caller woken by
 `ErrLeadershipLost` already sees the new role.
 

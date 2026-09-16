@@ -210,17 +210,12 @@ func (s *Server) handleLeaderboard(w http.ResponseWriter, r *http.Request) {
 			return nil
 		}
 		found = true
-		rows, me := leaderboard(st, t, pid)
+		resp.Rows, resp.Me = leaderboardPage(st, t, pid, offset, limit)
 		resp.TournamentID = string(tid)
 		resp.Status = t.Status.String()
 		resp.Final = t.Status != tournament.Open
 		resp.Entrants = int32(len(t.Entries))
 		resp.Offset, resp.Limit = int32(offset), int32(limit)
-		resp.Me = me
-		resp.Rows = []LeaderboardRow{}
-		if offset < int64(len(rows)) {
-			resp.Rows = rows[offset:min(int64(len(rows)), offset+limit)]
-		}
 		return nil
 	}) {
 		return
@@ -233,31 +228,116 @@ func (s *Server) handleLeaderboard(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, resp)
 }
 
-// poll is one open events request.
+// poll is one open events request. player, tournament and from are fixed
+// when it opens; scanned and relevant are guarded by Server.mu.
 type poll struct {
 	cancel     context.CancelFunc
 	superseded atomic.Bool
+	player     tournament.PlayerID
+	tournament tournament.TournamentID
+	from       paxos.Slot
+	// scanned is the applied slot of the last scan that covered this poll,
+	// and relevant whether that scan found events for it after from.
+	scanned  paxos.Slot
+	relevant bool
 }
 
 // openPoll registers a player's events request and ends the previous one.
-func (s *Server) openPoll(p tournament.PlayerID, cancel context.CancelFunc) *poll {
+// It returns nil when the replica already holds MaxEventPolls requests of
+// other players.
+func (s *Server) openPoll(pl *poll) *poll {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if prev := s.polls[p]; prev != nil {
+	prev := s.polls[pl.player]
+	if prev == nil && len(s.polls) >= s.cfg.MaxEventPolls {
+		return nil
+	}
+	if prev != nil {
 		prev.superseded.Store(true)
 		prev.cancel()
 	}
-	pl := &poll{cancel: cancel}
-	s.polls[p] = pl
+	s.polls[pl.player] = pl
 	return pl
 }
 
-func (s *Server) closePoll(p tournament.PlayerID, pl *poll) {
+func (s *Server) closePoll(pl *poll) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.polls[p] == pl {
-		delete(s.polls, p)
+	if s.polls[pl.player] == pl {
+		delete(s.polls, pl.player)
 	}
+}
+
+// awaitEvents reports whether events request pl, woken because the applied
+// slot reached woke, may have events to answer with. Every open request
+// that wakes for the same slot shares one scan: a single backend read that
+// checks, for every open request, whether events exist after its cursor.
+// So an applied slot costs one read however many requests wait, plus one
+// read per request that has events. When the answer is false, nothing
+// visible to pl was applied up to the returned slot, and pl waits for a
+// slot above it. When the scan fails or ctx ends, the answer is true and
+// the request's own read answers.
+func (s *Server) awaitEvents(ctx context.Context, pl *poll, woke paxos.Slot) (bool, paxos.Slot) {
+	for {
+		s.mu.Lock()
+		if s.polls[pl.player] != pl {
+			// Superseded: the next scans no longer cover this request.
+			s.mu.Unlock()
+			return true, woke
+		}
+		if pl.scanned >= woke {
+			relevant, scanned := pl.relevant, pl.scanned
+			s.mu.Unlock()
+			return relevant, scanned
+		}
+		if running := s.scanning; running != nil {
+			s.mu.Unlock()
+			select {
+			case <-running:
+				continue
+			case <-ctx.Done():
+				return true, woke
+			}
+		}
+		done := make(chan struct{})
+		s.scanning = done
+		polls := make([]*poll, 0, len(s.polls))
+		for _, p := range s.polls {
+			polls = append(polls, p)
+		}
+		s.mu.Unlock()
+
+		relevant := make([]bool, len(polls))
+		var applied paxos.Slot
+		err := s.readScan(func(st *tournament.State) error {
+			applied = st.Applied()
+			for i, p := range polls {
+				relevant[i] = st.HasEvents(p.from, p.tournament, p.player)
+			}
+			return nil
+		})
+		s.mu.Lock()
+		if err == nil {
+			for i, p := range polls {
+				p.scanned, p.relevant = applied, relevant[i]
+			}
+		}
+		s.scanning = nil
+		close(done)
+		s.mu.Unlock()
+		if err != nil || applied < woke {
+			// A read that does not see the slot the wait returned cannot
+			// clear this request; its own read answers.
+			return true, woke
+		}
+	}
+}
+
+// readScan runs fn on the applied state for a scan of open events requests.
+func (s *Server) readScan(fn func(*tournament.State) error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), postCommitReadTimeout)
+	defer cancel()
+	return s.backend.Read(ctx, false, fn)
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
@@ -285,10 +365,16 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	pid := tournament.PlayerID(c.Player)
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(waitMs)*time.Millisecond)
 	defer cancel()
-	pl := s.openPoll(pid, cancel)
-	defer s.closePoll(pid, pl)
-
 	from := paxos.Slot(cursor)
+	pl := s.openPoll(&poll{cancel: cancel, player: pid, tournament: tid, from: from})
+	if pl == nil {
+		retryAfter(w, time.Second)
+		s.writeError(w, http.StatusServiceUnavailable, CodeUnavailable,
+			fmt.Sprintf("this replica holds %d open events requests; retry the same request", s.cfg.MaxEventPolls), true)
+		return
+	}
+	defer s.closePoll(pl)
+
 	for first := true; ; first = false {
 		var (
 			resp    = EventsResponse{Cursor: cursor, Events: []EventItem{}}
@@ -334,20 +420,37 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			s.writeJSON(w, http.StatusOK, resp)
 			return
 		}
-		_, err := s.backend.WaitApplied(ctx, applied)
-		switch {
-		case r.Context().Err() != nil:
-			return // the client went away
-		case pl.superseded.Load():
-			// A newer request of the player ends this one at once, with no
-			// events and the cursor of the last read.
-			setSlot(w.Header(), HeaderAppliedSlot, uint64(applied))
-			s.writeJSON(w, http.StatusOK, resp)
-			return
-		case err != nil && ctx.Err() == nil:
-			retryAfter(w, time.Second)
-			s.writeError(w, http.StatusServiceUnavailable, CodeUnavailable, "the replica is stopping; retry the same request", true)
-			return
+		// Wait for a slot that brings this request events, without a read
+		// of its own for the slots that do not.
+		for seen := applied; ; {
+			woke, err := s.backend.WaitApplied(ctx, seen)
+			switch {
+			case r.Context().Err() != nil:
+				return // the client went away
+			case pl.superseded.Load():
+				// A newer request of the player ends this one at once, with no
+				// events and the cursor of the last read.
+				setSlot(w.Header(), HeaderAppliedSlot, uint64(applied))
+				s.writeJSON(w, http.StatusOK, resp)
+				return
+			case err != nil && ctx.Err() == nil:
+				retryAfter(w, time.Second)
+				s.writeError(w, http.StatusServiceUnavailable, CodeUnavailable, "the replica is stopping; retry the same request", true)
+				return
+			}
+			if err != nil {
+				break // the wait is over: the read below answers
+			}
+			relevant, scanned := s.awaitEvents(ctx, pl, woke)
+			if pl.superseded.Load() {
+				setSlot(w.Header(), HeaderAppliedSlot, uint64(applied))
+				s.writeJSON(w, http.StatusOK, resp)
+				return
+			}
+			if relevant || ctx.Err() != nil {
+				break
+			}
+			seen = scanned
 		}
 	}
 }
