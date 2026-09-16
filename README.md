@@ -143,9 +143,9 @@ and `tournament` (for `game`, `ledger` and `tournament`), which inspect `go list
   internal/transport   Network (in-memory, seeded drop/dup/delay/partition), Local (in-process
                        bus), HTTP (POST /internal/paxos between processes)
   internal/api         net/http handlers: idempotency keys, forwarding, problem+json errors
-  internal/game        milestone 4, types only: Ladder card puzzle rules, deals, scores
-  internal/session     milestone 4, types only: HMAC session tokens, device verifiers
-  internal/intent      milestone 4, types only: the play API for game clients
+  internal/game        milestone 4: Ladder card puzzle rules, seeded deals, moves, scores
+  internal/session     milestone 4: HMAC session tokens, keyrings, device verifiers
+  internal/intent      milestone 4: the play API for game clients (sessions, intents, events)
   internal/sim         virtual clock, event heap, fault schedule, clients, scenarios, Checker
   cmd/arena            the service; cmd/chaos: the simulator's command line
 
@@ -156,7 +156,7 @@ and `tournament` (for `game`, `ledger` and `tournament`), which inspect `go list
   replog, ledger, tournament <- api        ledger, tournament <- sim
   jsonx  <- replog, replog/wal, tournament, api
   game   <- tournament
-  paxos, replica, session, tournament <- intent
+  game, ledger, paxos, replica, replog, session, tournament <- intent <- cmd/arena
 ```
 
 `paxos`, `replog`, `tournament`, `ledger` and `replica.Core` contain no
@@ -841,9 +841,9 @@ paxos-arena/
   internal/tournament/          deterministic state machine, codec, standings/pool/payout functions
   internal/replica/             Core (pure) and Runner (event loop)
   internal/api/                 HTTP handlers
-  internal/game/                milestone 4 types: card puzzle rules, deals, scores
-  internal/session/             milestone 4 types: session tokens
-  internal/intent/              milestone 4 types: play API routes and JSON bodies
+  internal/game/                milestone 4: card puzzle rules, deals, scores
+  internal/session/             milestone 4: session tokens and device verifiers
+  internal/intent/              milestone 4: the play API served by arena -play-listen
   internal/sim/                 deterministic simulation and invariant checker
   unity-client/                 milestone 4: C# client SDK layout (README only so far)
   docs/DESIGN.md                the specification

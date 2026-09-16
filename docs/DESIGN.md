@@ -361,12 +361,12 @@ paxos-arena/
     replog/wal/                 append-only file store implementing replog.Store
     transport/                  in-memory fault-injecting network; HTTP transport
     tournament/                 deterministic tournament state machine and command codec
-    game/                       Ladder card puzzle rules, deals and scores (milestone 4, types only)
+    game/                       Ladder card puzzle rules, deals and scores (milestone 4)
     ledger/                     append-only double-entry book with idempotent postings
     replica/                    Core (log + state machine, pure) and Runner (event loop)
     api/                        net/http handlers, idempotency handling, forwarding
-    session/                    HMAC session tokens and device verifiers (milestone 4, types only)
-    intent/                     the play API for game clients (milestone 4, types only)
+    session/                    HMAC session tokens and device verifiers (milestone 4)
+    intent/                     the play API for game clients (milestone 4)
     sim/                        virtual clock, event heap, fault schedule, clients, invariant checker
   unity-client/                 C# client SDK layout (milestone 4, README only)
   docs/
@@ -391,7 +391,7 @@ replog <- replog/wal <- cmd/arena
 replog, ledger, tournament <- api        ledger, tournament <- sim
 jsonx  <- replog, replog/wal, tournament, api
 game   <- tournament
-paxos, replica, session, tournament <- intent
+game, ledger, paxos, replica, replog, session, tournament <- intent <- cmd/arena
 ```
 
 `internal/paxos`, `internal/replog`, `internal/tournament`, `internal/ledger`
@@ -1586,12 +1586,17 @@ Stated so that the boundary of the system is explicit.
 - Authentication and authorization. A request's player identifier and
   eligibility attributes (jurisdiction, age) are claims taken as given. There
   is no session, no signature, no TLS, no operator role separation; anyone
-  who can reach the API can create, close and settle tournaments.
+  who can reach the API can create, close and settle tournaments. Milestone
+  4 adds device-bound sessions and signed tokens for game clients on the
+  separate play listener (`docs/UNITY-INTEGRATION.md` section 2); the
+  operator API described here stays unauthenticated.
 - Lease-based reads. The lease affects only who may run Phase 1. Consistent
   reads always pay a heartbeat round.
 - The game itself. No rules engine, no deal generation beyond a 64-bit seed,
   no replay validation of input logs, no anomaly detection. `InputDigest` is
-  stored, not checked.
+  stored, not checked. Milestone 4 adds, for play tournaments only, the
+  Ladder rules engine, deals from committed seeds and scores computed by the
+  state machine (`docs/UNITY-INTEGRATION.md` sections 4 to 6).
 - Display leaderboards, matchmaking, ratings, pairing of scores, tax
   reporting, deposits and withdrawals, multiple fund types.
 - Byzantine faults. Replicas crash, restart, get partitioned and see

@@ -1,8 +1,13 @@
 # Unity integration: the contract for server-authoritative play
 
-Status: contract for milestone 4, written 2026-09-17. Nothing described here
-is implemented yet except the Go types listed in section 10.1, which compile
-and carry no behaviour.
+Status: contract for milestone 4, written 2026-09-17. The server side
+(sections 2 to 7 and 10) is implemented in `internal/game`,
+`internal/session`, `internal/intent`, the play commands of
+`internal/tournament`, the claim posting of `internal/ledger`,
+`replica.Runner.WaitApplied` and the play flags of `cmd/arena`; the few
+places where the implementation settled a detail this document left open
+are recorded in section 13.1. The client SDK of section 11 is built
+separately in `unity-client/`.
 
 This document is written for two implementers who work in parallel without
 talking to each other:
@@ -162,7 +167,7 @@ Every replica verifies every token itself, in this order, and answers `401`:
 | not four dot-separated parts, first part not `v1`, bad base64url, payload not exactly the four fields | `session_invalid` |
 | `kid` not in the replica's keyring | `session_invalid` |
 | mac differs (compared in constant time) | `session_invalid` |
-| `exp - iat` above 24 hours | `session_invalid` |
+| `exp` before `iat`, or `exp - iat` above 24 hours | `session_invalid` |
 | `iat` more than 30 s after the replica's clock | `session_invalid` |
 | the replica's clock more than 30 s after `exp` | `session_expired` |
 
@@ -485,9 +490,10 @@ section 5.4; the first failing rule is the result.
   for tournaments with client-reported scores, whose behaviour does not
   change, or `ladder-v1`. `CreateTournament` answers `invalid_rules` when
   `Game` is neither, or is `ladder-v1` with `max_score` other than 14 400.
-- `tournament.Result` gains `Play *PlayOutcome` (`json:"play,omitempty"`),
-  set by play commands and nil otherwise, so existing encodings and state
-  hashes do not change.
+- `tournament.Result` gains `Play PlayOutcome` (`json:"play,omitzero"`),
+  set by play commands and zero otherwise, so existing encodings and state
+  hashes do not change. It is a value, not a pointer, so a `Result` stays
+  comparable and never shares memory with the results table (13.1).
 - `tournament.State` gains: bindings by device, player records by player,
   round records by (tournament, player, round), the event records in slot
   order with an index per tournament and per player, and `clock` (4.5), which
@@ -844,7 +850,7 @@ at any later time:
 |---|---|---|
 | `ok`, first application or replay | the route's success status | the route's body below, `replayed` set accordingly; `X-Arena-Slot`, `X-Arena-Next-Seq` |
 | `device_mismatch` | 403 | error body, `retryable` false; `X-Arena-Slot` |
-| any other rejection | 409 | error body with the rejection's code and detail, `retryable` false; `X-Arena-Slot`, `X-Arena-Next-Seq` for sequenced intents |
+| any other rejection | 409 | error body with the rejection's code and detail, `retryable` false; `X-Arena-Slot`, `X-Arena-Next-Seq` for sequenced intents (absent on `unknown_player`, which has no number) |
 | `key_reused` (not recorded) | 422 | error body, `retryable` false |
 
 Success bodies are rebuilt from the recorded `PlayOutcome` and replicated
@@ -1622,10 +1628,10 @@ deadline; 300 seconds for at most 51 moves leaves room for it (13.2).
 
 ## 10. Server layout (Go)
 
-### 10.1 Types that already exist
+### 10.1 Types declared with the contract
 
-Package documentation and exported types only, no functions, added together
-with this contract:
+Package documentation and exported types, added together with this
+contract and implemented by the functions of 10.3:
 
 | File | Declares |
 |---|---|
@@ -1640,22 +1646,30 @@ package of the module.
 
 ### 10.2 Dependencies
 
-When implemented:
-
 ```
-game                                                <- tournament, intent
-session                                             <- intent, cmd/arena
-game, jsonx, paxos, replica, session, tournament    <- intent <- cmd/arena
+game                                                              <- tournament, intent
+session                                                           <- intent, cmd/arena
+game, jsonx, ledger, paxos, replica, replog, session, tournament  <- intent <- cmd/arena
 ```
 
-Today `tournament` already imports `game`, and `intent` imports
-`paxos`, `replica`, `session` and `tournament`; `cmd/arena` does not import
-`intent` yet. `game` imports only `crypto/hmac`, `crypto/sha256`,
-`encoding/binary`, `encoding/hex`, `errors` and `fmt`, and stays pure.
-`session` imports only the standard library. `intent` does not import `api`;
-the two HTTP packages share nothing but `jsonx`.
+`intent` imports `ledger` for the claim posting key and `replog` for the
+leader's errors and roles. `game` imports only `crypto/hmac`,
+`crypto/sha256`, `encoding/binary`, `encoding/hex`, `errors` and `fmt`, and
+stays pure. `session` imports only the standard library. `intent` does not
+import `api`; the two HTTP packages share nothing but `jsonx`.
 
-### 10.3 Functions to implement
+### 10.3 Functions
+
+The functions below are implemented as listed. The implementation adds, in
+the same packages: `game.Card.Suit`, `Card.Valid`, `Board.Clone` and
+`Board.WasteCard`; `session.Keyring.Validate`, `ValidKeyID`,
+`ValidDeviceSecret`, `ErrBadKeySpec`, `ErrBadDevice` and `MaxTokenLen`;
+`tournament.State.Progress` (an entry's dealt, finished and in-play rounds),
+`State.Header` and `State.Entry` (reads that do not copy every entry),
+`State.EventCount` and `ClaimableAmount`; `intent.BuildRoundViewAt`, the
+view as of a result with the move count its outcome recorded, which
+`BuildRoundView` calls with every accepted move; `intent.RandomPlayerID`,
+`intent.NoLimits` and `intent.Config.TrustedProxies`.
 
 ```go
 package game
@@ -1724,7 +1738,9 @@ func BuildRoundView(st *tournament.State, t tournament.TournamentID, p tournamen
 | `-deal-secret-file` | empty: `ARENA_DEAL_SECRET` | the deal secret (2.4) |
 
 With `-play-listen` set and no keyring or no deal secret, `arena` exits with
-an error naming the missing one.
+an error naming the missing one. With `-peers` and more than one replica,
+`-play-urls` must name every replica: a process knows only its own play
+address, and a follower needs the leader's to redirect.
 
 ---
 
@@ -2212,6 +2228,19 @@ Tests the implementations add:
   client parses it with `JsonUtility` into one fixed class.
 - Events in replicated state with the slot as cursor, so any replica can
   continue a stream another replica started.
+- Settled during implementation. `Result.Play` is a value with `omitzero`
+  rather than a pointer: the JSON encoding is the same, a `Result` stays
+  comparable (the simulator's checker compares results with `==`), and a
+  caller can never write through a result into the results table. A token
+  whose expiry precedes its issue time is `session_invalid`, like one whose
+  lifetime is too long. A round view built for a recorded result replays
+  the move count the result recorded (`BuildRoundViewAt`), because a round
+  record keeps its moves but not the slot of each. `unknown_player` carries
+  no `X-Arena-Next-Seq`, since the player has no number. In one replica per
+  process mode `-play-urls` is required. The simulator's D3 check leaves
+  claim postings out of a settled tournament's snapshot: a claim is the one
+  posting that follows a settlement, and it moves money out of a player
+  account, not out of the tournament.
 
 ### 13.2 Not covered
 
