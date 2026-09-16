@@ -11,6 +11,12 @@
 // required in this mode: a replica that restarts without its durable state
 // forgets promises and acknowledged commands, and must not rejoin under its
 // old identity.
+//
+// With -play-listen every replica also serves the play API of package intent
+// for game clients on a listener of its own (docs/UNITY-INTEGRATION.md). It
+// needs a session keyring (-session-keys-file or ARENA_SESSION_KEYS) and a
+// deal secret (-deal-secret-file or ARENA_DEAL_SECRET), and in one replica
+// per process mode the public play URL of every replica (-play-urls).
 package main
 
 import (
@@ -33,10 +39,12 @@ import (
 	"time"
 
 	"github.com/oguzhanozfe/paxos-arena/internal/api"
+	"github.com/oguzhanozfe/paxos-arena/internal/intent"
 	"github.com/oguzhanozfe/paxos-arena/internal/paxos"
 	"github.com/oguzhanozfe/paxos-arena/internal/replica"
 	"github.com/oguzhanozfe/paxos-arena/internal/replog"
 	"github.com/oguzhanozfe/paxos-arena/internal/replog/wal"
+	"github.com/oguzhanozfe/paxos-arena/internal/session"
 	"github.com/oguzhanozfe/paxos-arena/internal/transport"
 )
 
@@ -66,7 +74,18 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	walPath := fs.String("wal", "", "append-only file holding this replica's durable log state (required with -peers)")
 	logLevel := fs.String("log-level", "info", "log level: debug, info, warn, error")
 	logJSON := fs.Bool("log-json", false, "log JSON records instead of text")
+	var pf playFlags
+	fs.StringVar(&pf.listen, "play-listen", "", "address of the play API for game clients; with -nodes, node i uses port+i-1 (empty: play API off)")
+	fs.StringVar(&pf.urls, "play-urls", "", "public base URL of every replica's play listener, id=url comma separated (default: http:// and each play address)")
+	fs.StringVar(&pf.proxies, "play-trusted-proxies", "", "comma-separated proxy IP addresses whose X-Forwarded-For is believed")
+	fs.StringVar(&pf.keysFile, "session-keys-file", "", "file of session keys, one id=hex per line, the signing key first (default: $"+session.EnvKeys+")")
+	fs.DurationVar(&pf.ttl, "session-ttl", session.DefaultTTL, "session token lifetime, at most 24h")
+	fs.StringVar(&pf.dealFile, "deal-secret-file", "", "file holding the deal secret as hex (default: $"+intent.EnvDealSecret+")")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	play, err := loadPlay(pf, os.Getenv)
+	if err != nil {
 		return err
 	}
 	var level slog.LevelVar
@@ -80,7 +99,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 	logger := slog.New(handler)
 	if *peers != "" {
-		return runSingle(ctx, paxos.NodeID(*id), *peers, *listen, *walPath, logger, stdout)
+		return runSingle(ctx, paxos.NodeID(*id), *peers, *listen, *walPath, play, logger, stdout)
 	}
 	if *id != 0 {
 		return errors.New("-id requires -peers")
@@ -88,7 +107,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if *walPath != "" {
 		return errors.New("-wal requires -id and -peers: replicas started together with -nodes keep their state in memory")
 	}
-	return runCluster(ctx, *nodes, *listen, logger, stdout)
+	return runCluster(ctx, *nodes, *listen, play, logger, stdout)
 }
 
 // newHTTPServer returns a server with every timeout set.
@@ -133,7 +152,7 @@ func seededRNG(id paxos.NodeID) *rand.Rand {
 
 // runCluster starts n replicas on consecutive ports from listen and prints
 // how to exercise them.
-func runCluster(ctx context.Context, n int, listen string, logger *slog.Logger, stdout io.Writer) error {
+func runCluster(ctx context.Context, n int, listen string, play *playSetup, logger *slog.Logger, stdout io.Writer) error {
 	if n < 1 {
 		return errors.New("-nodes must be at least 1")
 	}
@@ -165,11 +184,22 @@ func runCluster(ctx context.Context, n int, listen string, logger *slog.Logger, 
 		listeners[id] = ln
 		urls[id] = "http://" + ln.Addr().String()
 	}
+	var playLns map[paxos.NodeID]net.Listener
+	var playURLs map[paxos.NodeID]string
+	if play != nil {
+		playLns, playURLs, err = play.playListeners(ids)
+		if err != nil {
+			for _, l := range listeners {
+				l.Close()
+			}
+			return err
+		}
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	bus := transport.NewLocal()
 	var wg sync.WaitGroup
-	errc := make(chan error, 2*n)
+	errc := make(chan error, 3*n)
 	for _, id := range ids {
 		core, err := replica.NewCore(replog.DefaultConfig(id, ids), replog.NewMemStore(), seededRNG(id))
 		if err != nil {
@@ -181,6 +211,22 @@ func runCluster(ctx context.Context, n int, listen string, logger *slog.Logger, 
 		bus.Register(id, runner.Deliver)
 		srv := newHTTPServer(api.New(api.Config{Self: id, Peers: urls}, runner, logger).Handler(), logger)
 		ln := listeners[id]
+		if play != nil {
+			h, err := play.server(id, playURLs, runner, logger)
+			if err != nil {
+				cancel()
+				wg.Wait()
+				return err
+			}
+			psrv, pln := newPlayHTTPServer(h, logger), playLns[id]
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := serve(ctx, psrv, pln); err != nil {
+					errc <- err
+				}
+			}()
+		}
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
@@ -195,7 +241,7 @@ func runCluster(ctx context.Context, n int, listen string, logger *slog.Logger, 
 			}
 		}()
 	}
-	printClusterInstructions(stdout, ids, urls)
+	printClusterInstructions(stdout, ids, urls, playURLs)
 	var first error
 	select {
 	case <-ctx.Done():
@@ -245,7 +291,7 @@ func parsePeers(spec string) (map[paxos.NodeID]string, []paxos.NodeID, error) {
 
 // runSingle runs one replica over the HTTP transport with its durable
 // state in the file at walPath.
-func runSingle(ctx context.Context, self paxos.NodeID, peersSpec, listen, walPath string, logger *slog.Logger, stdout io.Writer) error {
+func runSingle(ctx context.Context, self paxos.NodeID, peersSpec, listen, walPath string, play *playSetup, logger *slog.Logger, stdout io.Writer) error {
 	urls, ids, err := parsePeers(peersSpec)
 	if err != nil {
 		return err
@@ -259,6 +305,13 @@ func runSingle(ctx context.Context, self paxos.NodeID, peersSpec, listen, walPat
 	if walPath == "" {
 		return errors.New("-wal is required with -peers: a replica that restarts without its durable state " +
 			"would rejoin under its old id having forgotten its promises and acknowledged commands")
+	}
+	if play != nil && len(ids) > 1 {
+		for _, id := range ids {
+			if _, ok := play.urls[id]; !ok {
+				return fmt.Errorf("-play-urls must name every replica in -peers (node %d is missing): a follower redirects game clients to the leader's play URL", id)
+			}
+		}
 	}
 	store, err := wal.Open(walPath)
 	if err != nil {
@@ -285,10 +338,42 @@ func runSingle(ctx context.Context, self paxos.NodeID, peersSpec, listen, walPat
 	mux.Handle("/", api.New(api.Config{Self: self, Peers: urls}, runner, logger).Handler())
 	srv := newHTTPServer(mux, logger)
 
+	var psrv *http.Server
+	var pln net.Listener
+	var playURLs map[paxos.NodeID]string
+	if play != nil {
+		lns, derived, err := play.playListeners([]paxos.NodeID{self})
+		if err != nil {
+			ln.Close()
+			return err
+		}
+		pln = lns[self]
+		playURLs = derived
+		for id, u := range play.urls {
+			playURLs[id] = u
+		}
+		h, err := play.server(self, playURLs, runner, logger)
+		if err != nil {
+			ln.Close()
+			pln.Close()
+			return err
+		}
+		psrv = newPlayHTTPServer(h, logger)
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var wg sync.WaitGroup
-	errc := make(chan error, 2)
+	errc := make(chan error, 3)
+	if psrv != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := serve(ctx, psrv, pln); err != nil {
+				errc <- err
+			}
+		}()
+	}
 	wg.Add(3)
 	go func() { defer wg.Done(); tr.Run(ctx) }()
 	go func() {
@@ -310,6 +395,10 @@ func runSingle(ctx context.Context, self paxos.NodeID, peersSpec, listen, walPat
 	}
 	fmt.Fprintln(stdout)
 	printCurl(stdout, urls[self], urls, ids)
+	if playURLs != nil {
+		fmt.Fprintf(stdout, "arena: node %d play API listening on http://%s\n", self, pln.Addr())
+		printPlayInstructions(stdout, ids, playURLs, urls[self])
+	}
 	var first error
 	select {
 	case <-ctx.Done():
@@ -321,13 +410,16 @@ func runSingle(ctx context.Context, self paxos.NodeID, peersSpec, listen, walPat
 	return first
 }
 
-func printClusterInstructions(w io.Writer, ids []paxos.NodeID, urls map[paxos.NodeID]string) {
+func printClusterInstructions(w io.Writer, ids []paxos.NodeID, urls, playURLs map[paxos.NodeID]string) {
 	fmt.Fprintf(w, "arena: %d replicas in one process, connected by an in-memory bus\n", len(ids))
 	for _, id := range ids {
 		fmt.Fprintf(w, "  node %d  %s\n", id, urls[id])
 	}
 	fmt.Fprintln(w)
 	printCurl(w, urls[ids[0]], urls, ids)
+	if playURLs != nil {
+		printPlayInstructions(w, ids, playURLs, urls[ids[0]])
+	}
 	fmt.Fprintln(w, "To run replicas as separate processes, so that one can be killed and restarted, start each with its own log file:")
 	fmt.Fprintln(w, "  arena -id <n> -listen <host:port> -wal node<n>.wal -peers 1=http://127.0.0.1:8081,2=http://127.0.0.1:8082,3=http://127.0.0.1:8083")
 	fmt.Fprintln(w, "A replica restarted with the same -wal file keeps its promises, accepted values and chosen entries.")
