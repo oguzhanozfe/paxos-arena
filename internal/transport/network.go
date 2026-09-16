@@ -1,6 +1,7 @@
 // Package transport carries protocol messages between replicas. Network is
-// the in-memory fault-injecting transport for the deterministic simulation.
-// The HTTP transport for running separate processes is a later milestone.
+// the in-memory fault-injecting transport for the deterministic simulation,
+// Local connects replicas that share one process, and HTTP connects
+// separate processes.
 package transport
 
 import (

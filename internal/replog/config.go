@@ -44,6 +44,26 @@ func (r Role) String() string {
 	return fmt.Sprintf("role(%d)", uint8(r))
 }
 
+// MarshalText renders the role by name, so status documents read
+// "leader" rather than 2.
+func (r Role) MarshalText() ([]byte, error) {
+	if r > Leader {
+		return nil, fmt.Errorf("replog: unknown role %d", uint8(r))
+	}
+	return []byte(r.String()), nil
+}
+
+// UnmarshalText parses a role name.
+func (r *Role) UnmarshalText(b []byte) error {
+	for _, role := range []Role{Follower, Candidate, Leader} {
+		if role.String() == string(b) {
+			*r = role
+			return nil
+		}
+	}
+	return fmt.Errorf("replog: unknown role %q", string(b))
+}
+
 // UnsafeKnobs switches individual protocol rules off so that the simulator's
 // checker can be shown to catch the resulting violations. Every knob breaks
 // safety. It is nil in production and set only by tests in package sim.
