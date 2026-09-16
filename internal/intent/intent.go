@@ -21,6 +21,9 @@ package intent
 
 import (
 	"context"
+	"log/slog"
+	"net/netip"
+	"sync"
 	"time"
 
 	"github.com/oguzhanozfe/paxos-arena/internal/paxos"
@@ -45,7 +48,8 @@ type Backend interface {
 	WaitApplied(ctx context.Context, after paxos.Slot) (paxos.Slot, error)
 }
 
-// Rate is a token bucket: one token every Every, at most Burst held.
+// Rate is a token bucket: one token every Every, at most Burst held. A Rate
+// whose Burst is negative does not limit.
 type Rate struct {
 	// Every is the refill interval of one token.
 	Every time.Duration
@@ -110,12 +114,29 @@ type Config struct {
 	// PlayerIDPrefix and PlayerIDRandomLen lower-case base32 characters from
 	// crypto/rand.
 	NewPlayerID func() tournament.PlayerID
+	// TrustedProxies lists the peers whose first X-Forwarded-For address is
+	// taken as the client's address for the session-address rate limit.
+	TrustedProxies []netip.Addr
 }
 
 // Server holds the play API's handlers.
 type Server struct {
 	cfg     Config
 	backend Backend
+	log     *slog.Logger
+	proxies map[netip.Addr]bool
+
+	sessionDevice *limiter
+	sessionAddr   *limiter
+	intentLimit   *limiter
+	readLimit     *limiter
+	pollLimit     *limiter
+
+	mu sync.Mutex
+	// inflight holds the namespaced keys being submitted on this replica.
+	inflight map[tournament.IdempotencyKey]struct{}
+	// polls holds each player's open events request on this replica.
+	polls map[tournament.PlayerID]*poll
 }
 
 // Routes, as net/http patterns.

@@ -132,6 +132,46 @@ func (s *State) Player(id PlayerID) (PlayerRecord, bool) {
 	return ps.rec, true
 }
 
+// Header is a tournament record without its entries, standings and
+// payouts, for reads that list many tournaments.
+type Header struct {
+	// ID is the identifier.
+	ID TournamentID
+	// Rules are the rules, deep copied.
+	Rules Rules
+	// Status is the life-cycle state.
+	Status Status
+	// Entrants is the number of entries.
+	Entrants int
+	// Pool is the prize pool, set at Close.
+	Pool ledger.Money
+	// CreatedAt is the slot of the CreateTournament command.
+	CreatedAt paxos.Slot
+}
+
+// Header returns the header of tournament id.
+func (s *State) Header(id TournamentID) (Header, bool) {
+	t, ok := s.tournaments[id]
+	if !ok {
+		return Header{}, false
+	}
+	r := t.Rules
+	r.PrizeBps = append([]uint32(nil), r.PrizeBps...)
+	r.Exclusions.Jurisdictions = append([]string(nil), r.Exclusions.Jurisdictions...)
+	return Header{ID: t.ID, Rules: r, Status: t.Status, Entrants: len(t.Entries), Pool: t.Pool, CreatedAt: t.CreatedAt}, true
+}
+
+// Entry returns player p's entry in tournament t, and whether the
+// tournament exists.
+func (s *State) Entry(t TournamentID, p PlayerID) (e Entry, joined, exists bool) {
+	tr, ok := s.tournaments[t]
+	if !ok {
+		return Entry{}, false, false
+	}
+	e, joined = tr.Entry(p)
+	return e, joined, true
+}
+
 // Round returns a deep copy of round r of player p's entry in tournament t.
 func (s *State) Round(t TournamentID, p PlayerID, r int) (RoundRecord, bool) {
 	rec, ok := s.play.rounds[roundKey{t, p, r}]
