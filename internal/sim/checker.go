@@ -589,9 +589,18 @@ func (c *Checker) checkTournament(r *Run, nd *simNode, st *tournament.State, tid
 		}
 	}
 	// D3: the replicated record and postings never change after Settle.
+	// A player's claim of a settled payout (docs/UNITY-INTEGRATION.md
+	// section 6.8) is the one posting that follows a settlement; it moves
+	// money out of a player account, not out of the settled tournament.
 	c.count("D3")
 	enc := tournament.EncodeTournament(t)
-	pe := tournament.EncodePostings(posts)
+	settledPosts := make([]ledger.Posting, 0, len(posts))
+	for _, p := range posts {
+		if p.Kind != ledger.Claim {
+			settledPosts = append(settledPosts, p)
+		}
+	}
+	pe := tournament.EncodePostings(settledPosts)
 	if snap, ok := c.settled[tid]; ok {
 		if !bytes.Equal(snap.record, enc) {
 			c.fail(r, "D3", "node %d: settled tournament %s record differs from its record at settlement", nd.id, tid)
