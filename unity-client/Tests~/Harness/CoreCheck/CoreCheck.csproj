@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Compiles Runtime/Core alone as a netstandard2.1 library with C# 9, the
+    profile of Unity 2022.3, so an API or a language feature Unity lacks fails
+    here instead of in the editor.
+  -->
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <LangVersion>9.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <AssemblyName>PaxosArena.Client.Core</AssemblyName>
+    <RootNamespace>PaxosArena.Client</RootNamespace>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../../Runtime/Core/**/*.cs" LinkBase="Core" />
+  </ItemGroup>
+</Project>

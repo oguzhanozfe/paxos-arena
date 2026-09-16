@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    The SDK's test harness (section 11.6 of docs/UNITY-INTEGRATION.md).
+    It compiles the Runtime/Core sources directly, with a System.Net.Http
+    transport, a file store and a System.Text.Json codec that exist only here.
+    unity-client/README.md lists the commands. The target framework follows the
+    installed SDK; set the HarnessTargetFramework property (for example net8.0)
+    to build with an older one.
+  -->
+  <PropertyGroup>
+    <HarnessTargetFramework Condition="'$(HarnessTargetFramework)' == ''">net10.0</HarnessTargetFramework>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>$(HarnessTargetFramework)</TargetFramework>
+    <LangVersion>9.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <AssemblyName>PaxosArena.Client.Harness</AssemblyName>
+    <RootNamespace>PaxosArena.Client.Harness</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="*.cs" />
+    <Compile Include="../../Runtime/Core/**/*.cs" LinkBase="Core" />
+    <!-- The Unity store's file logic is tested here; its Application default is never called. -->
+    <Compile Include="../../Runtime/Unity/PersistentDataIntentStore.cs" LinkBase="Unity" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../UnityStubs/UnityStubs.csproj" />
+  </ItemGroup>
+</Project>

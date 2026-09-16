@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Compiles Runtime/Unity as its own assembly, as Unity does from its asmdef:
+    it sees only the public surface of PaxosArena.Client.Core, and the engine
+    through the compile-only stubs.
+  -->
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <LangVersion>9.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <AssemblyName>PaxosArena.Client.Unity</AssemblyName>
+    <RootNamespace>PaxosArena.Client.Unity</RootNamespace>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../../Runtime/Unity/**/*.cs" LinkBase="Unity" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../Harness/CoreCheck/CoreCheck.csproj" />
+    <ProjectReference Include="../UnityStubs.csproj" />
+  </ItemGroup>
+</Project>

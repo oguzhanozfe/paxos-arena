@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Compiles Samples~/ArenaSample as its own assembly against the Core and
+    Unity assemblies and the compile-only stubs. Building this project builds
+    the Core, Unity and stub projects too.
+  -->
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <LangVersion>9.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <AssemblyName>PaxosArena.Client.Sample</AssemblyName>
+    <RootNamespace>PaxosArena.Client.Sample</RootNamespace>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../../Samples~/ArenaSample/**/*.cs" LinkBase="Sample" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../Harness/CoreCheck/CoreCheck.csproj" />
+    <ProjectReference Include="../UnityCheck/UnityCheck.csproj" />
+    <ProjectReference Include="../UnityStubs.csproj" />
+  </ItemGroup>
+</Project>
