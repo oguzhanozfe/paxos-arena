@@ -8,7 +8,9 @@ below, the deviation is recorded in `docs/adr/` and the ADR takes precedence;
 `docs/research/domain.md` section 9. Protocol claims rest on the sources
 collected in `docs/research/consensus.md`; Go conventions follow
 `docs/research/go-practice.md`. Neither research note is repeated here beyond
-what an implementer needs.
+what an implementer needs. Milestone 4, server-authoritative play from a
+mobile game client, is specified in `docs/UNITY-INTEGRATION.md`, which
+takes precedence over this document for everything it covers.
 
 Module: `github.com/oguzhanozfe/paxos-arena`. Standard library only.
 `go 1.26.0` in `go.mod`, no `toolchain` line.
@@ -359,12 +361,17 @@ paxos-arena/
     replog/wal/                 append-only file store implementing replog.Store
     transport/                  in-memory fault-injecting network; HTTP transport
     tournament/                 deterministic tournament state machine and command codec
+    game/                       Ladder card puzzle rules, deals and scores (milestone 4, types only)
     ledger/                     append-only double-entry book with idempotent postings
     replica/                    Core (log + state machine, pure) and Runner (event loop)
     api/                        net/http handlers, idempotency handling, forwarding
+    session/                    HMAC session tokens and device verifiers (milestone 4, types only)
+    intent/                     the play API for game clients (milestone 4, types only)
     sim/                        virtual clock, event heap, fault schedule, clients, invariant checker
+  unity-client/                 C# client SDK layout (milestone 4, README only)
   docs/
     DESIGN.md                   this document
+    UNITY-INTEGRATION.md        the milestone 4 contract
     research/
     adr/                        one short file per decision taken during implementation
   testdata/
@@ -372,8 +379,8 @@ paxos-arena/
 ```
 
 Dependency direction. `TestNoForbiddenImports` in `internal/replog` (for
-`paxos` and `replog`) and in `internal/tournament` (for `ledger` and
-`tournament`) inspects `go list -deps`; the edges above the core are kept by
+`paxos` and `replog`) and in `internal/tournament` (for `game`, `ledger`
+and `tournament`) inspects `go list -deps`; the edges above the core are kept by
 review:
 
 ```
@@ -383,13 +390,17 @@ replog <- transport  <- sim, cmd/arena
 replog <- replog/wal <- cmd/arena
 replog, ledger, tournament <- api        ledger, tournament <- sim
 jsonx  <- replog, replog/wal, tournament, api
+game   <- tournament
+paxos, replica, session, tournament <- intent
 ```
 
 `internal/paxos`, `internal/replog`, `internal/tournament`, `internal/ledger`
 import only `encoding/json`, `crypto/sha256`, `errors`, `fmt`, `sort`,
 `strconv`, `strings`, `time` (for `time.Duration` only), `math/rand/v2` (for
 the injected `*rand.Rand` type only), `encoding/hex` (in `tournament`, for
-the input digest rendered as hex), `internal/jsonx` and each other. `internal/replog/wal` is
+the input digest rendered as hex), `internal/jsonx` and each other;
+`tournament` also imports `internal/game`, which imports no other package of
+the module and, for deals, may use `crypto/hmac` and `encoding/binary`. `internal/replog/wal` is
 the one store that touches the file system and is kept out of `replog` so the
 rule stays mechanical.
 

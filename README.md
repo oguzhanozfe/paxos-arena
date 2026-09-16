@@ -125,7 +125,7 @@ answers consistent reads.
 
 Packages and the dependency direction. The core packages' dependencies are
 enforced by `TestNoForbiddenImports` in `replog` (for `paxos` and `replog`)
-and `tournament` (for `ledger` and `tournament`), which inspect `go list
+and `tournament` (for `game`, `ledger` and `tournament`), which inspect `go list
 -deps`; the edges above them are kept by review:
 
 ```
@@ -143,6 +143,9 @@ and `tournament` (for `ledger` and `tournament`), which inspect `go list
   internal/transport   Network (in-memory, seeded drop/dup/delay/partition), Local (in-process
                        bus), HTTP (POST /internal/paxos between processes)
   internal/api         net/http handlers: idempotency keys, forwarding, problem+json errors
+  internal/game        milestone 4, types only: Ladder card puzzle rules, deals, scores
+  internal/session     milestone 4, types only: HMAC session tokens, device verifiers
+  internal/intent      milestone 4, types only: the play API for game clients
   internal/sim         virtual clock, event heap, fault schedule, clients, scenarios, Checker
   cmd/arena            the service; cmd/chaos: the simulator's command line
 
@@ -152,6 +155,8 @@ and `tournament` (for `ledger` and `tournament`), which inspect `go list
   replog <- replog/wal <- cmd/arena
   replog, ledger, tournament <- api        ledger, tournament <- sim
   jsonx  <- replog, replog/wal, tournament, api
+  game   <- tournament
+  paxos, replica, session, tournament <- intent
 ```
 
 `paxos`, `replog`, `tournament`, `ledger` and `replica.Core` contain no
@@ -722,7 +727,9 @@ Each item is a boundary of the system as built, not an oversight.
   floors, an external payment provider and reconciliation are out of scope.
 - Authentication, authorisation, TLS. Player identifiers, jurisdiction and
   age are claims taken as given. Anyone who can reach the API can create,
-  close and settle tournaments. The inter-replica transport is plain HTTP
+  close and settle tournaments. The milestone 4 contract adds device-bound
+  sessions with signed tokens for game clients on a separate listener; the
+  operator API stays unauthenticated. The inter-replica transport is plain HTTP
   and does not authenticate its peers.
 - Transport. The one-process demo uses an in-memory bus. The HTTP transport
   is best effort: `Send` never blocks, a full per-peer queue drops the
@@ -735,7 +742,10 @@ Each item is a boundary of the system as built, not an oversight.
   promises over HTTP until it has caught up through a leader.
 - The game. No rules engine, no deal generation beyond a 64-bit seed, no
   replay validation of input logs, no anomaly detection; `input_digest` is
-  stored, not checked.
+  stored, not checked. Milestone 4 specifies server-authoritative play, with
+  a card puzzle whose every move and score the state machine decides, in
+  [`docs/UNITY-INTEGRATION.md`](docs/UNITY-INTEGRATION.md); only its Go types
+  exist so far.
 - Lease-based reads, display leaderboards, matchmaking, ratings, tax
   reporting, multiple fund types.
 - Byzantine faults. Replicas crash, restart, partition and see delayed,
@@ -831,8 +841,13 @@ paxos-arena/
   internal/tournament/          deterministic state machine, codec, standings/pool/payout functions
   internal/replica/             Core (pure) and Runner (event loop)
   internal/api/                 HTTP handlers
+  internal/game/                milestone 4 types: card puzzle rules, deals, scores
+  internal/session/             milestone 4 types: session tokens
+  internal/intent/              milestone 4 types: play API routes and JSON bodies
   internal/sim/                 deterministic simulation and invariant checker
+  unity-client/                 milestone 4: C# client SDK layout (README only so far)
   docs/DESIGN.md                the specification
+  docs/UNITY-INTEGRATION.md     milestone 4 contract: server-authoritative play from a game client
   docs/adr/                     decisions taken during implementation
   docs/research/                consensus, domain and Go practice notes with sources
   testdata/seeds.txt            seeds that once failed (empty)
