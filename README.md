@@ -845,7 +845,8 @@ Four layers, all under the race detector in CI.
    even cluster sizes, clock skew without the lease, extreme reordering,
    partitions that flap faster than an election. The ones that found
    defects run by default as regression tests; two load and determinism
-   sweeps run with `ARENA_REVIEW_REPRO=1`.
+   sweeps run with `ARENA_REVIEW_REPRO=1`, and the leaderboard cost-ratio check is logged but not
+   enforced on CI runners, where wall-clock ratios under `-race` are too noisy.
 
 The checker is itself tested: `sim.TestCheckerDetectsKnownBugs` turns on four
 planted bugs (`replog.UnsafeKnobs`: accept below the promise, ignore Phase 1
