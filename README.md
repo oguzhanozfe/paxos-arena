@@ -145,6 +145,8 @@ and `tournament` (for `game`, `ledger` and `tournament`), which inspect `go list
                        results table keyed by idempotency key, canonical codec, hash chain
   internal/replica     Core (one Node + one State, no goroutines) and Runner (the one
                        event-loop goroutine per process)
+  internal/debugfeed   arena -debug-feed: a Runner observer that keeps one replica's messages,
+                       roles and commits in a ring and serves GET /debug/events
   internal/transport   Network (in-memory, seeded drop/dup/delay/partition), Local (in-process
                        bus), HTTP (POST /internal/paxos between processes)
   internal/api         net/http handlers: idempotency keys, forwarding, problem+json errors
@@ -163,6 +165,7 @@ and `tournament` (for `game`, `ledger` and `tournament`), which inspect `go list
   game   <- tournament
   game, ledger, paxos, replica, replog, session, tournament <- intent <- cmd/arena
   game, intent, session <- sim
+  paxos, replica, replog, tournament <- debugfeed <- cmd/arena
 ```
 
 `paxos`, `replog`, `tournament`, `ledger` and `replica.Core` contain no
@@ -454,6 +457,93 @@ through the API; `cmd/arena/adversarial_test.go`
 (`TestAttackRestartedReplicaForgetsAcknowledgedCreate`) starts replicas
 through the command's own flag handling, restarts one from its file after
 the leader dies, and requires the acknowledged tournament to survive.
+
+### The debug feed: protocol traffic for a visualiser
+
+`arena -debug-feed` (off by default) makes every replica record the
+Multi-Paxos messages its event loop sends and receives, its role changes and
+its commit and apply progress, and serve them read-only on its operator
+listener, so that a visualiser (a Unity scene of the cluster, say) can follow
+a live cluster. It works in both modes, one process with the in-memory bus
+and one replica per process over HTTP. Without the flag the route does not
+exist (`404`) and nothing is recorded. Recording runs on the event loop
+through `replica.Observer` and is bounded: no I/O, a ring of the last 4 096
+events per replica (`internal/debugfeed`), and a command value decoded for
+its summary only up to 16 KiB.
+
+**The feed has no authentication and exposes protocol traffic** (ballots,
+slots, roles, and every command's operation name and identifiers, though never
+keys, seeds, scores or rules), so keep `-listen` on loopback while it is on;
+`arena` prints a line saying so when it starts.
+
+`GET /debug/events?after=<seq>&limit=<n>&wait_ms=<ms>&heartbeats=<0|1>`
+
+| Parameter | Default | Range | Meaning |
+|---|---|---|---|
+| `after` | 0 | any `uint64` | return the events whose `seq` is higher |
+| `limit` | 256 | 1-1024 | events per response |
+| `wait_ms` | 0 | 0-2000 | with no event to return, wait up to this long for one (long poll) |
+| `heartbeats` | 0 | 0 or 1 | include `heartbeat` and `heartbeat_ack`, which are most of the volume |
+
+A value out of range is `400 malformed_request`, a method other than GET or
+HEAD `405`. The body is `{"node", "next", "dropped", "events"}`: pass `next`
+as `after` in the next request (it also moves past heartbeats left out);
+`dropped` counts the events after `after` that the ring overwrote before they
+were read. A `next` lower than the `after` sent means the replica restarted
+and numbers its events from 1 again. Every event has the same thirteen members,
+integers and strings only, with 0 or `""` where one does not apply, so a
+`JsonUtility` class can mirror it:
+
+| Member | Meaning |
+|---|---|
+| `seq` | the replica's event number, from 1 |
+| `at_ms` | wall-clock time of recording, Unix milliseconds |
+| `node` | the replica that recorded it |
+| `kind` | `send`, `recv`, `role`, `commit` or `applied` |
+| `from`, `to` | sender and receiver of a message |
+| `type` | the message: `prepare`, `promise`, `accept`, `accepted`, `nack`, `learn`, `learn_request`, `heartbeat`, `heartbeat_ack`; for `role`, the new role: `leader`, `follower`, `candidate` |
+| `ballot_round`, `ballot_node` | the message's ballot; for `role`, `commit` and `applied`, the ballot of the leader the replica knows (0 while none is known) |
+| `slot` | the slot of an accept, accepted, nack or learn; the first slot a prepare or learn_request asks for; the slot applied |
+| `commit_index` | the sender's commit index on a promise, heartbeat or heartbeat_ack; the replica's own on `role`, `commit` and `applied` |
+| `value` | the command of an accept, a learn or an applied slot, by operation and identifiers only: `create_tournament t1`, `join t1/p2`, `play_move t1/p2 r1 m4`, `noop` |
+| `detail` | short text: `accepted 2, slots 5-7` on a promise, `promised r4.n3, lease 120ms` on a nack, `leader 2` on `role`, `from 1` on `commit`, the result code (`ok`, `not_open`, ...) on `applied` |
+
+A `role` event is recorded when the role, the leader the replica knows or that
+leader's ballot changes. Within one step of the event loop the messages come
+first, then the `role`, `commit` and `applied` events the step caused. The run
+below took a cursor on the leader, created a tournament and read the next
+eight events (the response is one line, broken here after each event):
+
+```
+$ go run ./cmd/arena -nodes 3 -listen 127.0.0.1:18081 -log-level warn -debug-feed
+...
+arena: -debug-feed is on: GET /debug/events on every operator listener exposes protocol traffic (messages, ballots, slots, roles, command names and ids) without authentication; serve it on loopback only
+
+$ L=http://127.0.0.1:18082            # node 2 leads (GET /v1/node)
+$ NEXT=$(curl -s "$L/debug/events?limit=1024" | sed -n 's/.*"next":\([0-9]*\).*/\1/p')    # 446, every event so far
+$ curl -s -X POST $L/v1/tournaments -H 'Idempotency-Key: create-t1' -H 'Content-Type: application/json' -d '{"id":"t1", ...}'
+$ curl -s "$L/debug/events?after=$NEXT&limit=8"
+{"node":2,"next":454,"dropped":0,"events":[
+{"seq":447,"at_ms":1789638641819,"node":2,"kind":"send","from":2,"to":1,"type":"accept","ballot_round":1,"ballot_node":2,"slot":2,"commit_index":0,"value":"create_tournament t1","detail":""},
+{"seq":448,"at_ms":1789638641819,"node":2,"kind":"send","from":2,"to":3,"type":"accept","ballot_round":1,"ballot_node":2,"slot":2,"commit_index":0,"value":"create_tournament t1","detail":""},
+{"seq":449,"at_ms":1789638641819,"node":2,"kind":"recv","from":3,"to":2,"type":"accepted","ballot_round":1,"ballot_node":2,"slot":2,"commit_index":0,"value":"","detail":""},
+{"seq":450,"at_ms":1789638641819,"node":2,"kind":"send","from":2,"to":1,"type":"learn","ballot_round":1,"ballot_node":2,"slot":2,"commit_index":0,"value":"create_tournament t1","detail":""},
+{"seq":451,"at_ms":1789638641819,"node":2,"kind":"send","from":2,"to":3,"type":"learn","ballot_round":1,"ballot_node":2,"slot":2,"commit_index":0,"value":"create_tournament t1","detail":""},
+{"seq":452,"at_ms":1789638641820,"node":2,"kind":"commit","from":0,"to":0,"type":"","ballot_round":1,"ballot_node":2,"slot":0,"commit_index":2,"value":"","detail":"from 1"},
+{"seq":453,"at_ms":1789638641820,"node":2,"kind":"applied","from":0,"to":0,"type":"","ballot_round":1,"ballot_node":2,"slot":2,"commit_index":2,"value":"create_tournament t1","detail":"ok"},
+{"seq":454,"at_ms":1789638641820,"node":2,"kind":"recv","from":1,"to":2,"type":"accepted","ballot_round":1,"ballot_node":2,"slot":2,"commit_index":0,"value":"","detail":""}
+]}
+```
+
+Slot 2 was chosen when node 3's `accepted` gave the leader a majority; node
+1's arrived after the commit. A visualiser polls each replica in a loop with
+`after=<next>&wait_ms=2000`: the request returns as soon as an event it wants
+is recorded, and with an empty list after two quiet seconds.
+`internal/debugfeed` tests the ring's wrap-around and `dropped` accounting,
+concurrent appends under `-race`, the JSON shape, the heartbeat filter and the
+long poll; `cmd/arena/debugfeed_test.go` finds a created tournament's slot on
+the leader's feed in both modes and checks that the route is `404` without
+the flag.
 
 ### `cmd/chaos`: the simulator
 
@@ -1138,6 +1228,7 @@ paxos-arena/
   internal/ledger/              double-entry Book with idempotent postings
   internal/tournament/          deterministic state machine, codec, standings/pool/payout functions
   internal/replica/             Core (pure) and Runner (event loop)
+  internal/debugfeed/           ring buffer and GET /debug/events of arena -debug-feed
   internal/api/                 HTTP handlers
   internal/game/                milestone 4: card puzzle rules, deals, scores
   internal/session/             milestone 4: session tokens and device verifiers

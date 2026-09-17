@@ -17,6 +17,13 @@
 // needs a session keyring (-session-keys-file or ARENA_SESSION_KEYS) and a
 // deal secret (-deal-secret-file or ARENA_DEAL_SECRET), and in one replica
 // per process mode the public play URL of every replica (-play-urls).
+//
+// With -debug-feed every replica records the Multi-Paxos messages it sends
+// and receives, its role changes and its commit progress in a bounded buffer
+// and serves them read-only on GET /debug/events of its operator listener
+// (package debugfeed), for a visualiser. The feed has no authentication and
+// exposes protocol traffic, so the operator listener must then stay on
+// loopback.
 package main
 
 import (
@@ -39,6 +46,7 @@ import (
 	"time"
 
 	"github.com/oguzhanozfe/paxos-arena/internal/api"
+	"github.com/oguzhanozfe/paxos-arena/internal/debugfeed"
 	"github.com/oguzhanozfe/paxos-arena/internal/intent"
 	"github.com/oguzhanozfe/paxos-arena/internal/paxos"
 	"github.com/oguzhanozfe/paxos-arena/internal/replica"
@@ -74,6 +82,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	walPath := fs.String("wal", "", "append-only file holding this replica's durable log state (required with -peers)")
 	logLevel := fs.String("log-level", "info", "log level: debug, info, warn, error")
 	logJSON := fs.Bool("log-json", false, "log JSON records instead of text")
+	debugFeed := fs.Bool("debug-feed", false, "record each replica's protocol messages, roles and commits and serve them on GET "+debugfeed.Path+
+		" of the operator listener, without authentication (keep -listen on loopback)")
 	var pf playFlags
 	fs.StringVar(&pf.listen, "play-listen", "", "address of the play API for game clients; with -nodes, node i uses port+i-1 (empty: play API off)")
 	fs.StringVar(&pf.urls, "play-urls", "", "public base URL of every replica's play listener, id=url comma separated (default: http:// and each play address)")
@@ -99,7 +109,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 	logger := slog.New(handler)
 	if *peers != "" {
-		return runSingle(ctx, paxos.NodeID(*id), *peers, *listen, *walPath, play, logger, stdout)
+		return runSingle(ctx, paxos.NodeID(*id), *peers, *listen, *walPath, play, *debugFeed, logger, stdout)
 	}
 	if *id != 0 {
 		return errors.New("-id requires -peers")
@@ -107,7 +117,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if *walPath != "" {
 		return errors.New("-wal requires -id and -peers: replicas started together with -nodes keep their state in memory")
 	}
-	return runCluster(ctx, *nodes, *listen, play, logger, stdout)
+	return runCluster(ctx, *nodes, *listen, play, *debugFeed, logger, stdout)
 }
 
 // newHTTPServer returns a server with every timeout set.
@@ -150,9 +160,24 @@ func seededRNG(id paxos.NodeID) *rand.Rand {
 	return rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), uint64(id)))
 }
 
+// debugFeedNotice is printed once at startup when -debug-feed is on.
+const debugFeedNotice = "arena: -debug-feed is on: GET " + debugfeed.Path + " on every operator listener exposes protocol traffic " +
+	"(messages, ballots, slots, roles, command names and ids) without authentication; serve it on loopback only"
+
+// newFeed returns the debug feed of replica id installed on runner, or nil
+// when the feed is off.
+func newFeed(on bool, id paxos.NodeID, runner *replica.Runner) *debugfeed.Feed {
+	if !on {
+		return nil
+	}
+	feed := debugfeed.New(id)
+	runner.Observe(feed)
+	return feed
+}
+
 // runCluster starts n replicas on consecutive ports from listen and prints
 // how to exercise them.
-func runCluster(ctx context.Context, n int, listen string, play *playSetup, logger *slog.Logger, stdout io.Writer) error {
+func runCluster(ctx context.Context, n int, listen string, play *playSetup, debugFeed bool, logger *slog.Logger, stdout io.Writer) error {
 	if n < 1 {
 		return errors.New("-nodes must be at least 1")
 	}
@@ -208,8 +233,16 @@ func runCluster(ctx context.Context, n int, listen string, play *playSetup, logg
 			return err
 		}
 		runner := replica.NewRunner(core, bus.Send, logger)
+		feed := newFeed(debugFeed, id, runner)
 		bus.Register(id, runner.Deliver)
-		srv := newHTTPServer(api.New(api.Config{Self: id, Peers: urls}, runner, logger).Handler(), logger)
+		var operator http.Handler = api.New(api.Config{Self: id, Peers: urls}, runner, logger).Handler()
+		if feed != nil {
+			mux := http.NewServeMux()
+			mux.Handle(debugfeed.Path, feed.Handler())
+			mux.Handle("/", operator)
+			operator = mux
+		}
+		srv := newHTTPServer(operator, logger)
 		ln := listeners[id]
 		if play != nil {
 			h, err := play.server(id, playURLs, runner, logger)
@@ -242,6 +275,9 @@ func runCluster(ctx context.Context, n int, listen string, play *playSetup, logg
 		}()
 	}
 	printClusterInstructions(stdout, ids, urls, playURLs)
+	if debugFeed {
+		fmt.Fprintln(stdout, debugFeedNotice)
+	}
 	var first error
 	select {
 	case <-ctx.Done():
@@ -291,7 +327,7 @@ func parsePeers(spec string) (map[paxos.NodeID]string, []paxos.NodeID, error) {
 
 // runSingle runs one replica over the HTTP transport with its durable
 // state in the file at walPath.
-func runSingle(ctx context.Context, self paxos.NodeID, peersSpec, listen, walPath string, play *playSetup, logger *slog.Logger, stdout io.Writer) error {
+func runSingle(ctx context.Context, self paxos.NodeID, peersSpec, listen, walPath string, play *playSetup, debugFeed bool, logger *slog.Logger, stdout io.Writer) error {
 	urls, ids, err := parsePeers(peersSpec)
 	if err != nil {
 		return err
@@ -332,9 +368,13 @@ func runSingle(ctx context.Context, self paxos.NodeID, peersSpec, listen, walPat
 	}
 	var tr *transport.HTTP
 	runner := replica.NewRunner(core, func(env replog.Envelope) { tr.Send(env) }, logger)
+	feed := newFeed(debugFeed, self, runner)
 	tr = transport.NewHTTP(self, urls, runner.Deliver, nil, logger)
 	mux := http.NewServeMux()
 	mux.Handle("POST "+transport.Path, tr.Handler())
+	if feed != nil {
+		mux.Handle(debugfeed.Path, feed.Handler())
+	}
 	mux.Handle("/", api.New(api.Config{Self: self, Peers: urls}, runner, logger).Handler())
 	srv := newHTTPServer(mux, logger)
 
@@ -398,6 +438,9 @@ func runSingle(ctx context.Context, self paxos.NodeID, peersSpec, listen, walPat
 	if playURLs != nil {
 		fmt.Fprintf(stdout, "arena: node %d play API listening on http://%s\n", self, pln.Addr())
 		printPlayInstructions(stdout, ids, playURLs, urls[self])
+	}
+	if debugFeed {
+		fmt.Fprintln(stdout, debugFeedNotice)
 	}
 	var first error
 	select {

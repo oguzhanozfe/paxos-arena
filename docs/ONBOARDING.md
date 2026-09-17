@@ -11,7 +11,7 @@ and the order in which to read it. The [README](../README.md) is the full refere
 | Approach | Three to five replicas agree on one ordered log of commands with **Multi-Paxos**. A **deterministic state machine** applies the log and owns a **double-entry ledger**, so every replica holds identical tournaments and balances. Every command carries an **idempotency key** whose result is replicated, so retries never pay twice. |
 | Game clients | A **server-authoritative play API** for a Unity mobile client: the phone sends intents (join, deal, play, finish, claim), the cluster decides every card, move, score and payout. A **C# SDK** (`unity-client/`) keeps intents on the device and resends them safely across app kills and leader changes. |
 | Proof | A deterministic **simulator** runs whole clusters in one goroutine under crashes, torn writes, partitions, loss, duplication, reordering and clock skew, checking **20 invariants** after every event (S1-S8 consensus, D1-D6 money, P1-P6 play). **14 named fault scenarios**, reviewers' adversarial tests, an end-to-end run of the C# SDK against three real processes with the leader killed mid-round. |
-| Size | 98 Go files (about 30 400 lines, standard library only) and 30 C# files (about 8 200 lines); 14 architecture decision records. |
+| Size | 106 Go files (about 32 200 lines, standard library only) and 30 C# files (about 8 200 lines); 14 architecture decision records. |
 
 ## See it work (10 minutes)
 
@@ -49,6 +49,8 @@ What to look for in the tour:
   from the new leader, a resend is a replay and a second settle is refused. One settlement, 675 + 405 + 270 = 1350.
 - **Step 9**: the restarted replica reads its log file, catches up, and reports the same state hash as the others.
 - **Step 11**: the invariant table. A violation would print the seed and the exact command that replays it.
+
+To watch the Multi-Paxos messages, roles and commits of a live cluster (for a visualiser), start `arena` with `-debug-feed` and read `GET /debug/events` on loopback: see [the debug feed](../README.md#the-debug-feed-protocol-traffic-for-a-visualiser).
 
 ## Read the code in this order
 

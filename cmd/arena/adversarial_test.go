@@ -67,13 +67,14 @@ func advGet(url string, out any) int {
 // and waits until it serves. The -wal flag was added by the fix: per-process
 // mode now refuses to start without a durable store, so the test passes the
 // same file on every start of a replica, exactly as an operator restarting
-// a killed process would.
-func advStartReplica(t *testing.T, id paxos.NodeID, addr, peers, dir string) *advReplica {
+// a killed process would. Flags in extra are appended to the command line.
+func advStartReplica(t *testing.T, id paxos.NodeID, addr, peers, dir string, extra ...string) *advReplica {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &advReplica{id: id, addr: addr, url: "http://" + addr, cancel: cancel, errc: make(chan error, 1)}
 	args := []string{"-id", fmt.Sprint(id), "-listen", addr, "-peers", peers, "-log-level", "error",
 		"-wal", filepath.Join(dir, fmt.Sprintf("node%d.wal", id))}
+	args = append(args, extra...)
 	go func() { p.errc <- run(ctx, args, io.Discard, io.Discard) }()
 	deadline := time.Now().Add(10 * time.Second)
 	for advGet(p.url+"/healthz", nil) != http.StatusOK {
