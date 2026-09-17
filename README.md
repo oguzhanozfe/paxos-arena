@@ -13,6 +13,9 @@ repository is a case study in consensus and fault-injection testing, not a
 production service: the log is never compacted, membership is fixed, and no
 money moves outside the ledger.
 
+New here? Run `scripts/tour.sh` (a ten-minute guided run of a three-replica cluster losing its leader
+mid-settlement) and read [`docs/ONBOARDING.md`](docs/ONBOARDING.md) for the reading order.
+
 Contents: [The problem](#the-problem) |
 [Why consensus](#why-consensus-rather-than-a-single-database) |
 [Architecture](#architecture) | [Running it](#running-it) |
