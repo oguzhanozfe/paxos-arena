@@ -1,7 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using PaxosArena.Client.Unity;
+using System.Text;
+using PaxosArena.Client.UnityAdapters;
 
 namespace PaxosArena.Client.Harness
 {
@@ -47,6 +48,15 @@ namespace PaxosArena.Client.Harness
                 T("request and response JSON match the contract", JsonMatchesContract),
                 T("Appendix A deals and greedy games", LadderAuditVectors),
                 T("the persistent store writes atomically and recovers", PersistentStoreRecovers),
+                T("a throwing callback during a resynchronisation stops no other notification", ThrowingCallbackDuringResync),
+                T("a throwing callback or connection handler on a 2xx loses nothing", ThrowingCallbackOnSuccess),
+                T("a 2xx without X-Arena-Slot or a readable body is resent with its key", UnreadableSuccessIsResent),
+                T("long-poll responses are not clock samples", LongPollsAreNotClockSamples),
+                T("after resume one authenticated request goes first; an expired token costs one 401", ResumeProbesBeforeSending),
+                T("a redirect from https to http is neither followed nor cached", HttpsDowngradeRefused),
+                T("an answer the store cannot save is resent, then delivered once", StoreFailureKeepsTheHead),
+                T("an idle Update allocates nothing", IdleUpdateAllocatesNothing),
+                T("the store recovers from its .tmp, keeps unreadable files and allows one client", PersistentStoreKeepsIdentity),
                 T("real HTTP: a follower's 307, headers and timeouts through HttpClientTransport", HttpTransportTests.RoundTrip),
             };
             int failed = 0;
@@ -536,7 +546,7 @@ namespace PaxosArena.Client.Harness
             rig.Tick(126);
             FakeTransport.Exchange third = rig.Single("POST", "/v1/tournaments/t1/join");
             Eq("http://d.test", third.Origin, "retried at the cached leader");
-            rig.Answer(third, 201, JoinBody(rig, 2), "X-Arena-Leader", "http://d.test");
+            rig.Answer(third, 201, JoinBody(rig, 2), "X-Arena-Leader", "http://d.test", "X-Arena-Slot", "40");
             rig.Client.Deal("t1", 1, null);
             rig.Tick();
             Eq("http://d.test", rig.Single("POST", "/v1/tournaments/t1/rounds/1/deal").Origin, "later intents go to the leader");
@@ -549,7 +559,7 @@ namespace PaxosArena.Client.Harness
             rig.Tick();
             rig.Answer(rig.Single("POST", "/v1/tournaments/t1/join"), 307, ErrorJson("not_leader", true),
                 "Location", "http://c.test/v1/tournaments/t1/join", "X-Arena-Leader", "http://c.test");
-            rig.Answer(rig.Single("POST", "/v1/tournaments/t1/join"), 201, JoinBody(rig, 2), "X-Arena-Leader", "http://e.test");
+            rig.Answer(rig.Single("POST", "/v1/tournaments/t1/join"), 201, JoinBody(rig, 2), "X-Arena-Leader", "http://e.test", "X-Arena-Slot", "40");
 
             rig.Client.Deal("t1", 1, null);
             rig.Tick();
@@ -635,10 +645,16 @@ namespace PaxosArena.Client.Harness
             Eq(0L, rig.Client.ServerNowMs, "clock samples cleared on resume");
             rig.Tick();
             Eq(1, rig.Resumes, "Resumed raised inside Update");
-            List<FakeTransport.Exchange> open = rig.Transport.Open();
-            Eq(2, open.Count, "the head and the events poll restart at once");
-            rig.Find("/v1/tournaments/t1/join");
-            rig.Find("/v1/events?cursor=0");
+            Check(!rig.Client.HasSession, "no session is claimed before the clock estimate is back");
+            // Without a clock estimate the token may have expired while paused:
+            // the head goes at once, alone, and the events poll follows the
+            // first response.
+            FakeTransport.Exchange again = rig.Single("POST", "/v1/tournaments/t1/join");
+            rig.Answer(again, 201, JoinBody(rig, 2), "X-Arena-Slot", "40", "X-Arena-Server-Time-Ms", ServerTime);
+            Check(rig.Client.HasSession, "the estimate is back");
+            FakeTransport.Exchange quick = rig.Single("GET", "/v1/events?cursor=0&wait_ms=0");
+            rig.Answer(quick, 200, "{\"cursor\":0,\"applied_slot\":40,\"has_more\":false,\"events\":[]}", "X-Arena-Server-Time-Ms", ServerTime);
+            rig.Single("GET", "/v1/events?cursor=0&wait_ms=25000");
             rig.Client.Resume();
             rig.Tick();
             Eq(1, rig.Resumes, "Resume without Pause does nothing");
@@ -676,6 +692,8 @@ namespace PaxosArena.Client.Harness
             Check(threw, "the handler's exception reaches the caller of Update");
             Eq(0L, rig.Client.Events.Cursor, "cursor not advanced when delivery failed");
             rig.Tick();
+            rig.NoneOpen();
+            rig.Tick(125);
             poll = rig.Single("GET", "/v1/events?cursor=0");
             rig.Answer(poll, 200, body);
             Eq(1, received.Count, "event delivered");
@@ -872,9 +890,9 @@ namespace PaxosArena.Client.Harness
             rig.Tick(126);
             open = rig.Transport.Open();
             Eq(2, open.Count, "resent after the watchdog");
-            rig.Answer(silent, 201, JoinBody(rig, 2));
+            rig.Answer(silent, 201, JoinBody(rig, 2), "X-Arena-Slot", "40");
             Eq(1, rig.Client.PendingCount, "a late answer to an abandoned attempt is ignored");
-            rig.Answer(open[1], 201, JoinBody(rig, 2));
+            rig.Answer(open[1], 201, JoinBody(rig, 2), "X-Arena-Slot", "40");
             Eq(0, rig.Client.PendingCount, "the current attempt completes the intent");
         }
 
@@ -1033,6 +1051,324 @@ namespace PaxosArena.Client.Harness
             }
             finally
             {
+                if (Directory.Exists(dir))
+                {
+                    Directory.Delete(dir, true);
+                }
+            }
+        }
+        static void ThrowingCallbackDuringResync()
+        {
+            Rig rig = new Rig().Started();
+            int second = 0;
+            int third = 0;
+            rig.Client.Join("t1", r => { throw new InvalidOperationException("a destroyed UI object"); });
+            rig.Client.Deal("t1", 1, r => second++);
+            rig.Client.Draw("t1", 1, 0, r => third++);
+            rig.Tick();
+            FakeTransport.Exchange join = rig.Single("POST", "/v1/tournaments/t1/join");
+            rig.Transport.Answer(join, Response(409, ErrorJson("stale_seq", false), "X-Arena-Slot", "60", "X-Arena-Next-Seq", "9"));
+            bool threw = false;
+            try
+            {
+                rig.Client.Update();
+            }
+            catch (InvalidOperationException)
+            {
+                threw = true;
+            }
+            Check(threw, "the callback's exception leaves Update");
+            Eq(3, rig.Outcomes.Count, "IntentCompleted for the head and both dropped intents");
+            Eq(1, second, "the second callback ran");
+            Eq(1, third, "the third callback ran");
+            Eq(1, rig.Resyncs, "Resynced raised");
+            Eq(0, rig.Client.PendingCount, "queue empty");
+            Eq(8L, rig.Stored.last_assigned_seq, "numbering from X-Arena-Next-Seq");
+            rig.Tick();
+            Eq(3, rig.Outcomes.Count, "nothing delivered twice");
+        }
+
+        static void ThrowingCallbackOnSuccess()
+        {
+            Rig rig = new Rig().Started();
+            rig.Client.Deal("t1", 1, r => { throw new InvalidOperationException("deal callback"); });
+            rig.Tick();
+            FakeTransport.Exchange deal = rig.Single("POST", "/v1/tournaments/t1/rounds/1/deal");
+            rig.Transport.Answer(deal, Response(201, RoundBody(rig, 2, 0), "X-Arena-Slot", "41"));
+            bool threw = false;
+            try
+            {
+                rig.Client.Update();
+            }
+            catch (InvalidOperationException)
+            {
+                threw = true;
+            }
+            Check(threw, "the callback's exception leaves Update");
+            Eq(1, rig.Outcomes.Count, "IntentCompleted raised");
+            Eq(0, rig.Client.PendingCount, "the intent completed");
+            Check(rig.Client.FindAudit("t1", 1) != null, "the deal audit is kept");
+
+            // A ConnectionChanged handler that throws must not skip the backoff.
+            rig.Client.ConnectionChanged += state => { throw new InvalidOperationException("connection handler"); };
+            ArenaResult<JoinResponse> joined = null;
+            rig.Client.Join("t1", r => joined = r);
+            rig.Tick();
+            FakeTransport.Exchange join = rig.Single("POST", "/v1/tournaments/t1/join");
+            rig.Transport.Answer(join, Response(503, ErrorJson("unavailable", true), "Retry-After", "2"));
+            threw = false;
+            try
+            {
+                rig.Client.Update();
+            }
+            catch (InvalidOperationException)
+            {
+                threw = true;
+            }
+            Check(threw, "the handler's exception leaves Update");
+            rig.Tick(1000);
+            rig.NoneOpen();
+            rig.Tick(1001);
+            join = rig.Single("POST", "/v1/tournaments/t1/join");
+            rig.Transport.Answer(join, Response(201, JoinBody(rig, 3), "X-Arena-Slot", "42"));
+            try
+            {
+                rig.Client.Update();
+            }
+            catch (InvalidOperationException)
+            {
+                // ConnectionChanged to Online throws again.
+            }
+            Check(joined != null && joined.Ok, "the answer was delivered although the connection handler threw");
+            Eq(2, rig.Outcomes.Count, "two outcomes");
+        }
+
+        static void UnreadableSuccessIsResent()
+        {
+            Rig rig = new Rig().Started();
+            ArenaResult<ClaimResponse> claimed = null;
+            rig.Client.ClaimPayout("t1", r => claimed = r);
+            rig.Tick();
+            FakeTransport.Exchange first = rig.Single("POST", "/v1/tournaments/t1/payout/claim");
+            rig.Answer(first, 200, "<html>Sign in to Wi-Fi</html>");
+            Check(claimed == null, "no callback for a portal page");
+            Eq(1, rig.Client.PendingCount, "the claim stays pending");
+            Eq(ConnectionState.Retrying, rig.Client.Connection, "a retryable failure");
+            rig.Tick(126);
+            FakeTransport.Exchange second = rig.Single("POST", "/v1/tournaments/t1/payout/claim");
+            Eq(first.Request.Header("Idempotency-Key"), second.Request.Header("Idempotency-Key"), "same key");
+            Eq(first.Request.Body, second.Request.Body, "same body");
+            string body = rig.Json.ToJson(new ClaimResponse { slot = 90, next_seq = 3, tournament_id = "t1", amount = 675, posting_key = "claim:t1:" + PlayerA });
+            // A body cut short under a 200 that does carry the header.
+            rig.Answer(second, 200, body.Substring(0, body.Length / 2), "X-Arena-Slot", "90");
+            Check(claimed == null, "no callback for a truncated body");
+            rig.Tick(8000);
+            FakeTransport.Exchange third = rig.Single("POST", "/v1/tournaments/t1/payout/claim");
+            rig.Answer(third, 200, body.Replace("\"replayed\":false", "\"replayed\":true"), "X-Arena-Slot", "90");
+            Check(claimed != null && claimed.Ok && claimed.Value.amount == 675 && claimed.Value.replayed, "the recorded answer delivered");
+            Eq(1, rig.Outcomes.Count, "one outcome");
+            Eq(90L, rig.Stored.last_intent_slot, "slot recorded");
+        }
+
+        static void LongPollsAreNotClockSamples()
+        {
+            Rig rig = new Rig(o => o.FollowEvents = true);
+            long offset = 1789200000000 - 1000;
+            rig.Tick();
+            FakeTransport.Exchange session = rig.Single("POST", "/v1/session");
+            // The server writes its answer 20 ms after the request left, and it
+            // arrives 20 ms later: the midpoint rule is exact here.
+            rig.Now += 40;
+            rig.Answer(session, 200, rig.SessionBody(PlayerA, "tok1", 1, Expiry), "X-Arena-Server-Time-Ms", (rig.Now - 20 + offset).ToString(), "X-Arena-Slot", "5");
+            Eq(0L, rig.Client.ServerNowMs - (rig.Now + offset), "estimate after the session");
+            string idle = "{\"cursor\":0,\"applied_slot\":5,\"has_more\":false,\"events\":[]}";
+            for (int i = 0; i < 8; i++)
+            {
+                FakeTransport.Exchange poll = rig.Single("GET", "/v1/events?cursor=0&wait_ms=25000");
+                // Held for the whole wait, stamped when the wait ends.
+                rig.Now += 25020;
+                rig.Answer(poll, 200, idle, "X-Arena-Server-Time-Ms", (rig.Now - 20 + offset).ToString());
+                Eq(0L, rig.Client.ServerNowMs - (rig.Now + offset), "estimate after idle poll " + (i + 1));
+            }
+        }
+
+        static void ResumeProbesBeforeSending()
+        {
+            Rig rig = new Rig(o => o.FollowEvents = true).Started();
+            rig.Tick();
+            rig.Single("GET", "/v1/events?cursor=0&wait_ms=25000");
+            rig.Client.Pause();
+            rig.Now += 2 * 3600000;
+            rig.Client.Resume();
+            rig.Client.Draw("t1", 1, 0, null);
+            rig.Tick();
+            Check(!rig.Client.HasSession, "HasSession is false until the clock estimate is back");
+            FakeTransport.Exchange move = rig.Single("POST", "/v1/tournaments/t1/rounds/1/moves");
+            Eq("Bearer tok1", move.Request.Header("Authorization"), "the stored token is tried once");
+            rig.Tick(50);
+            rig.Single("POST", "/v1/tournaments/t1/rounds/1/moves");
+            long expired = Expiry + 2 * 3600000;
+            rig.Answer(move, 401, ErrorJson("session_expired", true), "X-Arena-Server-Time-Ms", expired.ToString());
+            FakeTransport.Exchange session = rig.Single("POST", "/v1/session");
+            rig.Answer(session, 200, rig.SessionBody(PlayerA, "tok2", 2, expired + 3600000), "X-Arena-Server-Time-Ms", expired.ToString(), "X-Arena-Slot", "70");
+            Check(rig.Client.HasSession, "a session after the refresh");
+            List<FakeTransport.Exchange> open = rig.Transport.Open();
+            Eq(2, open.Count, "the move and the events poll go with the new token");
+            foreach (FakeTransport.Exchange e in open)
+            {
+                Eq("Bearer tok2", e.Request.Header("Authorization"), "token of " + e.Path);
+            }
+            int oldToken = 0;
+            foreach (FakeTransport.Exchange e in rig.Transport.Sent)
+            {
+                if (e.Request.Header("Authorization") == "Bearer tok1" && e.Path.StartsWith("/v1/tournaments/", StringComparison.Ordinal))
+                {
+                    oldToken++;
+                }
+            }
+            Eq(1, oldToken, "one request carried the expired token");
+        }
+
+        static void HttpsDowngradeRefused()
+        {
+            Rig rig = new Rig(o => o.BaseUrls = new[] { "https://a.test" });
+            rig.Tick();
+            FakeTransport.Exchange session = rig.Single("POST", "/v1/session");
+            rig.Answer(session, 307, ErrorJson("not_leader", true),
+                "Location", "http://evil.example:8080/v1/session", "X-Arena-Leader", "http://evil.example:8080");
+            rig.NoneOpen();
+            Eq("", rig.Stored.leader_url, "not cached");
+            rig.Tick(126);
+            FakeTransport.Exchange again = rig.Single("POST", "/v1/session");
+            Eq("https://a.test", again.Origin, "retried at the https base URL");
+            // An https leader is followed and cached; an http hint is not adopted when it fails.
+            rig.Answer(again, 307, ErrorJson("not_leader", true), "Location", "https://c.test/v1/session", "X-Arena-Leader", "https://c.test");
+            Eq("https://c.test", rig.Stored.leader_url, "an https leader is cached");
+            FakeTransport.Exchange followed = rig.Single("POST", "/v1/session");
+            Eq("https://c.test", followed.Origin, "followed");
+            rig.Answer(followed, 503, ErrorJson("no_leader", true), "Retry-After", "1", "X-Arena-Leader", "http://evil.example:8080");
+            Eq("", rig.Stored.leader_url, "an http X-Arena-Leader hint is not adopted");
+
+            SystemTextJson json = new SystemTextJson();
+            MemoryStore store = new MemoryStore(json);
+            store.Save(new ClientState { leader_url = "http://evil.example:8080" });
+            ArenaClient restarted = new ArenaClient(new ArenaClientOptions { BaseUrls = new[] { "https://a.test" }, Jurisdiction = "TR", Age = 30 },
+                new FakeTransport(), store, json, () => 0);
+            Eq("", json.FromJson<ClientState>(store.Saved).leader_url, "a stored http leader is dropped under https base URLs");
+            restarted.Dispose();
+        }
+
+        static void StoreFailureKeepsTheHead()
+        {
+            Rig rig = new Rig().Started();
+            int callbacks = 0;
+            List<Exception> storeErrors = new List<Exception>();
+            rig.Client.StoreFailed += e => storeErrors.Add(e);
+            rig.Client.Draw("t1", 1, 0, r => callbacks++);
+            rig.Tick();
+            FakeTransport.Exchange move = rig.Single("POST", "/v1/tournaments/t1/rounds/1/moves");
+            rig.Store.FailSaves = 1;
+            rig.Transport.Answer(move, Response(200, RoundBody(rig, 2, 1), "X-Arena-Slot", "43"));
+            bool threw = false;
+            try
+            {
+                rig.Client.Update();
+            }
+            catch (IOException)
+            {
+                threw = true;
+            }
+            Check(threw, "the store's exception leaves Update");
+            Eq(0, callbacks, "nothing delivered that was not saved");
+            Eq(0, rig.Outcomes.Count, "no IntentCompleted");
+            Eq(1, rig.Client.PendingCount, "the head is back in memory");
+            rig.Tick();
+            Eq(1, storeErrors.Count, "StoreFailed raised inside the next Update");
+            rig.NoneOpen();
+            rig.Tick(125);
+            FakeTransport.Exchange again = rig.Single("POST", "/v1/tournaments/t1/rounds/1/moves");
+            Eq(move.Request.Header("Idempotency-Key"), again.Request.Header("Idempotency-Key"), "resent with its key");
+            rig.Answer(again, 200, RoundBody(rig, 2, 1).Replace("\"replayed\":false", "\"replayed\":true"), "X-Arena-Slot", "43");
+            Eq(1, callbacks, "delivered once");
+            Eq(1, rig.Outcomes.Count, "one outcome");
+            Eq(0, rig.Stored.pending.Length, "saved");
+        }
+
+        static void IdleUpdateAllocatesNothing()
+        {
+            Rig rig = new Rig(o => o.FollowEvents = true).Started();
+            rig.Client.Join("t1", null);
+            rig.Tick();
+            Eq(2, rig.Transport.Open().Count, "an intent and an events poll in flight");
+            for (int i = 0; i < 1000; i++)
+            {
+                rig.Client.Update();
+            }
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 100000; i++)
+            {
+                rig.Client.Update();
+            }
+            long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+            Check(allocated == 0, "100000 idle Updates allocated " + allocated + " bytes");
+            Check(rig.Client.BusyForMs >= 0 && rig.Client.ServerNowMs > 0, "reads work");
+        }
+
+        static void PersistentStoreKeepsIdentity()
+        {
+            SystemTextJson json = new SystemTextJson();
+            string dir = Path.Combine(Path.GetTempPath(), "paxos-arena-store-" + Guid.NewGuid().ToString("N"));
+            PersistentDataIntentStore store = new PersistentDataIntentStore(json, dir);
+            try
+            {
+                ClientState old = new ClientState
+                {
+                    device_id = "9f86d081884c7d659a2feaa0c55ad015",
+                    device_secret = "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
+                    player_id = "p-old",
+                };
+                Directory.CreateDirectory(dir);
+                File.WriteAllText(store.FilePath + ".tmp", json.ToJson(old), Encoding.UTF8);
+                File.WriteAllText(store.FilePath, "");
+                Eq("p-old", store.Load().player_id, "an unreadable file falls back to a complete .tmp");
+
+                bool refused = false;
+                try
+                {
+                    new PersistentDataIntentStore(json, dir).Dispose();
+                }
+                catch (InvalidOperationException)
+                {
+                    refused = true;
+                }
+                Check(refused, "a second store on the same directory is refused");
+
+                ArenaClient client = new ArenaClient(new ArenaClientOptions { BaseUrls = new[] { "http://a.test" }, Jurisdiction = "TR", Age = 30 },
+                    new FakeTransport(), store, json, () => 0);
+                Eq("p-old", client.PlayerId, "the old identity survives");
+                client.Flush();
+                Eq(old.device_id, json.FromJson<ClientState>(File.ReadAllText(store.FilePath)).device_id, "and is saved again");
+                client.Dispose();
+
+                File.WriteAllText(store.FilePath, "{\"version\":1,\"device_");
+                File.WriteAllText(store.FilePath + ".bak", "not json");
+                if (File.Exists(store.FilePath + ".tmp"))
+                {
+                    File.Delete(store.FilePath + ".tmp");
+                }
+                Eq("", store.Load().device_id, "nothing readable gives a fresh state");
+                Check(!File.Exists(store.FilePath) && File.Exists(store.FilePath + ".corrupt-1") &&
+                      File.Exists(store.FilePath + ".bak.corrupt-1"), "unreadable files are moved aside, not overwritten");
+
+                store.Dispose();
+                PersistentDataIntentStore reopened = new PersistentDataIntentStore(json, dir);
+                reopened.Save(new ClientState { player_id = "p-new" });
+                Eq("p-new", reopened.Load().player_id, "a disposed store's directory can be opened again");
+                reopened.Dispose();
+            }
+            finally
+            {
+                store.Dispose();
                 if (Directory.Exists(dir))
                 {
                     Directory.Delete(dir, true);

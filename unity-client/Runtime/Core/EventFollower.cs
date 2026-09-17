@@ -7,10 +7,13 @@ namespace PaxosArena.Client
     /// Follows GET /v1/events with a long-poll (section 7.3.10). The cursor is a
     /// slot, the same on every replica, and is stored with the client state. It
     /// advances only after every event of a response was handed to
-    /// <see cref="Received"/>, so a handler that throws sees those events again.
+    /// <see cref="Received"/>, so a handler that throws sees those events again,
+    /// after a backoff.
     /// The poll runs while the client has a session, is not paused and
     /// <see cref="ArenaClientOptions.FollowEvents"/> is set; it is independent of
-    /// the intent queue.
+    /// the intent queue. Until a response has given the client a server clock
+    /// estimate (at start and after a resume) a poll asks with wait_ms=0, so it
+    /// returns at once.
     /// </summary>
     public sealed class EventFollower
     {
@@ -55,7 +58,14 @@ namespace PaxosArena.Client
             {
                 return;
             }
-            int wait = client.Options.EventsWaitMs;
+            call = NewPoll();
+        }
+
+        // A method of its own: a lambda capturing the call in Tick would
+        // allocate its closure on every Update, before the early return.
+        Call NewPoll()
+        {
+            int wait = client.HasClockEstimate ? client.Options.EventsWaitMs : 0;
             if (wait < 0)
             {
                 wait = 0;
@@ -72,9 +82,10 @@ namespace PaxosArena.Client
                 path += "&tournament_id=" + Uri.EscapeDataString(sentFilter);
             }
             Call c = client.NewCall(CallKind.Events, "GET", path, "", "", true, wait + 10000);
+            c.LongPoll = wait > 0;
             c.Answered = (response, error) => Answered(c, response, error);
             c.Abandoned = error => Abandoned(c, error);
-            call = c;
+            return c;
         }
 
         /// <summary>Forgets the poll after the client dropped every call (a halt or a new player).</summary>
@@ -120,14 +131,16 @@ namespace PaxosArena.Client
                 LastError = null;
                 EventItem[] items = body.events ?? new EventItem[0];
                 Action<EventItem> handler = Received;
-                if (handler != null)
+                for (int i = 0; i < items.Length && handler != null; i++)
                 {
-                    for (int i = 0; i < items.Length; i++)
+                    // A handler that throws stops the delivery; the cursor stays,
+                    // so the next poll hands these events over again. The
+                    // exception leaves ArenaClient.Update at its end.
+                    if (items[i] != null && !client.Invoke(handler, items[i]))
                     {
-                        if (items[i] != null)
-                        {
-                            handler(items[i]);
-                        }
+                        failures++;
+                        notBefore = now + client.BackoffPolicy.DelayMs(failures, 0);
+                        return;
                     }
                 }
                 client.AdvanceEventsCursor(body.cursor);

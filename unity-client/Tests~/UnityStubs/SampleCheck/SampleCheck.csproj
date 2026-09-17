@@ -16,6 +16,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../../../Samples~/ArenaSample/**/*.cs" LinkBase="Sample" />
+    <Compile Include="NameClashCheck.cs" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../../Harness/CoreCheck/CoreCheck.csproj" />

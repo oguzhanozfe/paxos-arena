@@ -497,18 +497,27 @@ namespace PaxosArena.Client.Harness
                 }
             }
             bool lost = sends.Exists(e => e.Status == 0 && e.Url.StartsWith(options.Play[oldIndex] + "/", StringComparison.Ordinal));
-            bool redirected = sends.Exists(e => e.Status == 307 && e.Url.StartsWith(options.Play[followerIndex] + "/", StringComparison.Ordinal) &&
-                                                e.Header(Headers.Location).StartsWith(options.Play[newIndex] + "/", StringComparison.Ordinal));
+            // The client learns the new leader from a follower's 307: on the
+            // move's own resend, or on a request of this client that reached
+            // the follower first. Until a response restores the clock estimate
+            // the rebuilt client sends one authenticated request at a time, so
+            // the quick events poll can restore it and a session refresh (30 s
+            // tokens) can take the 307 before the move is resent.
+            Exchange redirect = Array.Find(p.Transport.Exchanges, e => e.Status == 307 &&
+                e.Url.StartsWith(options.Play[followerIndex] + "/", StringComparison.Ordinal) &&
+                e.Header(Headers.Location).StartsWith(options.Play[newIndex] + "/", StringComparison.Ordinal));
             Exchange last = sends.Count > 0 ? sends[sends.Count - 1] : null;
-            Check(lost && redirected && last != null && last.Status == 200 && last.Url.StartsWith(options.Play[newIndex] + "/", StringComparison.Ordinal),
-                "the resend must fail on the killed leader, follow the follower's 307 and end on the new leader: " + string.Join("; ", sends.ConvertAll(Describe)));
+            Check(lost && redirect != null && last != null && last.Status == 200 && last.Url.StartsWith(options.Play[newIndex] + "/", StringComparison.Ordinal),
+                "the resend must fail on the killed leader, learn the new leader from the follower's 307 and end on the new leader: " +
+                string.Join("; ", sends.ConvertAll(Describe)) + (redirect == null ? "; no 307 from the follower" : ""));
+            string learned = redirect.Key == key ? "" : " (leader learned from the follower's 307 to " + redirect.Method + " " + new Uri(redirect.Url).AbsolutePath + ")";
             Check(p.Store.Load().leader_url == options.Play[newIndex], "the new leader is cached");
             Check(!oldCallback && p.Client.PendingCount == 0, "resume bookkeeping");
             p.LastMove = outcome;
             Step("3 player " + p.Index + " round " + round + ": move " + before.move_index + " (seq " + seq + ", key " + key +
                  ") applied, leader killed before the answer was delivered, client rebuilt from its store; resend: " +
                  string.Join(" -> ", sends.ConvertAll(e => Origin(e.Url) + " " + (e.Status == 0 ? "no response" : e.Status.ToString(CultureInfo.InvariantCulture)))) +
-                 " replayed");
+                 " replayed" + learned);
             return resumed.round;
         }
 
@@ -725,12 +734,12 @@ namespace PaxosArena.Client.Harness
                 bool paid = payouts.TryGetValue(p.Id, out sums) && sums[0] > 0;
                 KeyValuePair<string, int>[] expected =
                 {
-                    new KeyValuePair<string, int>(EventType.RoundStarted, 3),
-                    new KeyValuePair<string, int>(EventType.RoundFinished, 3),
-                    new KeyValuePair<string, int>(EventType.EntryScored, 1),
-                    new KeyValuePair<string, int>(EventType.TournamentStatus + ":" + TournamentStatus.Closed, 1),
-                    new KeyValuePair<string, int>(EventType.TournamentStatus + ":" + TournamentStatus.Settled, 1),
-                    new KeyValuePair<string, int>(EventType.PayoutAvailable, paid ? 1 : 0),
+                    new KeyValuePair<string, int>(ArenaEventType.RoundStarted, 3),
+                    new KeyValuePair<string, int>(ArenaEventType.RoundFinished, 3),
+                    new KeyValuePair<string, int>(ArenaEventType.EntryScored, 1),
+                    new KeyValuePair<string, int>(ArenaEventType.TournamentStatus + ":" + TournamentStatus.Closed, 1),
+                    new KeyValuePair<string, int>(ArenaEventType.TournamentStatus + ":" + TournamentStatus.Settled, 1),
+                    new KeyValuePair<string, int>(ArenaEventType.PayoutAvailable, paid ? 1 : 0),
                 };
                 // A replica that has not applied the settle yet answers with
                 // fewer events; scan again from cursor 0 until the step timeout.
@@ -756,7 +765,7 @@ namespace PaxosArena.Client.Harness
                     Thread.Sleep(300);
                 }
                 Check(mismatch.Length == 0, "player " + p.Index + ": " + mismatch);
-                PumpUntil(() => p.Events.Exists(e => e.type == EventType.EntryScored && e.player_id == p.Id), "the SDK follower delivered entry_scored");
+                PumpUntil(() => p.Events.Exists(e => e.type == ArenaEventType.EntryScored && e.player_id == p.Id), "the SDK follower delivered entry_scored");
                 Step("7 player " + p.Index + " events from cursor 0 are complete; the follower is at " + p.Client.Events.Cursor);
             }
         }
@@ -774,7 +783,7 @@ namespace PaxosArena.Client.Harness
                 {
                     Check(e.tournament_id == tid, "event of another tournament");
                     Check(e.player_id == "" || e.player_id == p.Id, "event of another player");
-                    string name = e.type == EventType.TournamentStatus ? e.type + ":" + e.status : e.type;
+                    string name = e.type == ArenaEventType.TournamentStatus ? e.type + ":" + e.status : e.type;
                     int n;
                     counts.TryGetValue(name, out n);
                     counts[name] = n + 1;

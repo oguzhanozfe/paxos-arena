@@ -11,7 +11,7 @@
     <ImplicitUsings>disable</ImplicitUsings>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <AssemblyName>PaxosArena.Client.Unity</AssemblyName>
-    <RootNamespace>PaxosArena.Client.Unity</RootNamespace>
+    <RootNamespace>PaxosArena.Client.UnityAdapters</RootNamespace>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
   <ItemGroup>

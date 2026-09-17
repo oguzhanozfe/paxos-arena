@@ -95,7 +95,7 @@ namespace PaxosArena.Client
     {
         public long slot;
 
-        /// <summary>One of <see cref="EventType"/>.</summary>
+        /// <summary>One of <see cref="ArenaEventType"/>.</summary>
         public string type = "";
 
         public string tournament_id = "";

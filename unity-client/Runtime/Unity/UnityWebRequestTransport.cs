@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.Text;
 using UnityEngine.Networking;
 
-namespace PaxosArena.Client.Unity
+namespace PaxosArena.Client.UnityAdapters
 {
     /// <summary>
     /// <see cref="IHttpTransport"/> over UnityWebRequest (section 11.3). Redirects
@@ -94,7 +94,18 @@ namespace PaxosArena.Client.Unity
             try
             {
                 long code = web.responseCode;
-                if (code != 0)
+                UnityWebRequest.Result result = web.result;
+                // A transfer that failed after the status line (a connection
+                // cut mid-body, a timeout, a body that could not be decoded)
+                // has a status but not the whole answer: it is reported as no
+                // response, so the client resends with the same key. A
+                // redirect keeps its status: its Location header is the answer,
+                // and with redirectLimit 0 some platforms report it as an error.
+                bool cut = code != 0 &&
+                           (result == UnityWebRequest.Result.ConnectionError ||
+                            result == UnityWebRequest.Result.DataProcessingError) &&
+                           (code < 300 || code >= 400);
+                if (code != 0 && !cut)
                 {
                     // Protocol errors (4xx, 5xx, a 307 with redirectLimit 0)
                     // still carry the status, headers and body the client needs.
@@ -106,6 +117,10 @@ namespace PaxosArena.Client.Unity
                 {
                     string error = web.error ?? "";
                     response.TransportError = error.Length > 0 ? error : "no response";
+                    if (cut)
+                    {
+                        response.TransportError = "HTTP " + code + " cut short: " + response.TransportError;
+                    }
                     response.TimedOut = error.IndexOf("timeout", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                         error.IndexOf("timed out", StringComparison.OrdinalIgnoreCase) >= 0;
                 }

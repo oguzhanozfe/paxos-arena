@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Runtime.ExceptionServices;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -71,6 +72,16 @@ namespace PaxosArena.Client
         ConnectionState connection = ConnectionState.Online;
         ArenaError haltError;
 
+        /// <summary>The first exception a game callback threw during the current Update, rethrown at its end.</summary>
+        ExceptionDispatchInfo callbackError;
+
+        /// <summary>True when a base URL is https: leader origins must then be https too.</summary>
+        readonly bool requireHttps;
+
+        /// <summary>Consecutive answers the store could not save, and when the head and a session may be sent again.</summary>
+        int storeFailures;
+        long storeNotBefore;
+
         /// <param name="options">Configuration; at least one base URL.</param>
         /// <param name="transport">Sends requests; must not follow redirects.</param>
         /// <param name="store">Persists the client state atomically.</param>
@@ -110,6 +121,13 @@ namespace PaxosArena.Client
             {
                 throw new ArgumentException("ArenaClientOptions.BaseUrls needs at least one absolute http or https URL", nameof(options));
             }
+            for (int i = 0; i < baseUrls.Length; i++)
+            {
+                if (baseUrls[i].StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                {
+                    requireHttps = true;
+                }
+            }
             if (!ValidJurisdiction(options.Jurisdiction))
             {
                 throw new ArgumentException("ArenaClientOptions.Jurisdiction must be 2 to 8 upper-case letters", nameof(options));
@@ -125,6 +143,10 @@ namespace PaxosArena.Client
             this.monotonicMs = monotonicMs;
             backoff = new Backoff(options.BackoffBaseMs, options.BackoffCapMs, random);
             state = Normalize(store.Load());
+            if (!AllowedOrigin(state.leader_url))
+            {
+                state.leader_url = "";
+            }
             queue = new IntentQueue(state, Save, options.MaxPendingIntents);
             events = new EventFollower(this);
             if (!IsLowerHex(state.device_id, 32) || !IsLowerHex(state.device_secret, 64))
@@ -152,16 +174,17 @@ namespace PaxosArena.Client
             get { return state.player_id; }
         }
 
-        /// <summary>True while a token is held that is not known to be expired.</summary>
+        /// <summary>
+        /// True while a token is held that has not expired by the server clock
+        /// estimate. False before the first response after start or
+        /// <see cref="Resume"/>, while the estimate is unknown.
+        /// </summary>
         public bool HasSession
         {
             get
             {
-                if (state.session_token.Length == 0)
-                {
-                    return false;
-                }
-                return !clock.HasEstimate || state.session_expires_at_ms > clock.NowMs(monotonicMs());
+                return state.session_token.Length > 0 && clock.HasEstimate &&
+                       state.session_expires_at_ms > clock.NowMs(monotonicMs());
             }
         }
 
@@ -237,8 +260,33 @@ namespace PaxosArena.Client
         /// <summary>Raised once when the client halts; see <see cref="HaltError"/>.</summary>
         public event Action<ArenaError> Halted;
 
-        /// <summary>Call every frame: delivers answers, sends and retries requests, and runs the events long-poll.</summary>
+        /// <summary>
+        /// Raised from <see cref="Update"/> for every exception the store threw
+        /// while saving. The client keeps the state it could not save in
+        /// memory, and an intent answer that could not be saved is not
+        /// delivered: the intent stays at the head and is resent with its key.
+        /// </summary>
+        public event Action<Exception> StoreFailed;
+
+        /// <summary>
+        /// Call every frame: delivers answers, sends and retries requests, and
+        /// runs the events long-poll. Every callback and event runs inside it.
+        /// A callback that throws does not stop the client: every state change,
+        /// save, callback and event of the Update still happens, and the first
+        /// exception is rethrown when the Update has finished.
+        /// </summary>
         public void Update()
+        {
+            UpdateCore();
+            ExceptionDispatchInfo error = callbackError;
+            callbackError = null;
+            if (error != null)
+            {
+                error.Throw();
+            }
+        }
+
+        void UpdateCore()
         {
             if (disposed)
             {
@@ -260,6 +308,22 @@ namespace PaxosArena.Client
                 EnsureHeadCall(now);
                 events.Tick(now);
             }
+            // Holding a token without a clock estimate (at start and after a
+            // resume), the client cannot tell whether the token expired while
+            // it was away: it sends one authenticated request at a time until a
+            // response restores the estimate, so an expired token costs one 401.
+            bool probing = state.session_token.Length > 0 && !clock.HasEstimate;
+            int authInFlight = 0;
+            if (probing)
+            {
+                for (int i = 0; i < calls.Count; i++)
+                {
+                    if (calls[i].InFlight && calls[i].Auth)
+                    {
+                        authInFlight++;
+                    }
+                }
+            }
             for (int i = 0; i < calls.Count; i++)
             {
                 Call c = calls[i];
@@ -280,6 +344,14 @@ namespace PaxosArena.Client
                 {
                     continue;
                 }
+                if (probing && c.Auth)
+                {
+                    if (authInFlight > 0)
+                    {
+                        continue;
+                    }
+                    authInFlight++;
+                }
                 Send(c, now);
             }
         }
@@ -297,6 +369,10 @@ namespace PaxosArena.Client
             }
             paused = true;
             generation++;
+            // The events poll is rebuilt on resume, so that the first poll does
+            // not wait on the server before the clock estimate is back.
+            DropCalls(CallKind.Events);
+            events.Detach();
             for (int i = 0; i < calls.Count; i++)
             {
                 calls[i].InFlight = false;
@@ -526,6 +602,57 @@ namespace PaxosArena.Client
             return monotonicMs();
         }
 
+        internal bool HasClockEstimate
+        {
+            get { return clock.HasEstimate; }
+        }
+
+        /// <summary>Runs a game callback; an exception is kept for the end of Update. Returns false when it threw.</summary>
+        internal bool Invoke(Action callback)
+        {
+            if (callback == null)
+            {
+                return true;
+            }
+            try
+            {
+                callback();
+                return true;
+            }
+            catch (Exception e)
+            {
+                KeepCallbackError(e);
+                return false;
+            }
+        }
+
+        /// <summary>Runs a game callback with an argument; an exception is kept for the end of Update. Returns false when it threw.</summary>
+        internal bool Invoke<T>(Action<T> callback, T argument)
+        {
+            if (callback == null)
+            {
+                return true;
+            }
+            try
+            {
+                callback(argument);
+                return true;
+            }
+            catch (Exception e)
+            {
+                KeepCallbackError(e);
+                return false;
+            }
+        }
+
+        void KeepCallbackError(Exception e)
+        {
+            if (callbackError == null)
+            {
+                callbackError = ExceptionDispatchInfo.Capture(e);
+            }
+        }
+
         internal Call NewCall(CallKind kind, string method, string pathAndQuery, string body, string key, bool auth, int timeoutMs)
         {
             Call c = new Call
@@ -611,7 +738,8 @@ namespace PaxosArena.Client
             }
             finally
             {
-                // A callback that threw leaves the rest of the batch for the next Update.
+                // Callbacks cannot throw out of HandleCompletion; a store that
+                // threw leaves the rest of the batch for the next Update.
                 if (!disposed && i + 1 < batch.Count)
                 {
                     completions.InsertRange(0, batch.GetRange(i + 1, batch.Count - i - 1));
@@ -628,22 +756,9 @@ namespace PaxosArena.Client
             }
             Action[] batch = deferred.ToArray();
             deferred.Clear();
-            int i = 0;
-            try
+            for (int i = 0; i < batch.Length && !disposed; i++)
             {
-                for (; i < batch.Length && !disposed; i++)
-                {
-                    batch[i]();
-                }
-            }
-            finally
-            {
-                if (!disposed && i + 1 < batch.Length)
-                {
-                    Action[] rest = new Action[batch.Length - i - 1];
-                    Array.Copy(batch, i + 1, rest, 0, rest.Length);
-                    deferred.InsertRange(0, rest);
-                }
+                Invoke(batch[i]);
             }
         }
 
@@ -731,7 +846,9 @@ namespace PaxosArena.Client
             }
 
             long serverTime;
-            if (TryParseLong(r.Header(Headers.ServerTimeMs), out serverTime))
+            // A long-poll's header is stamped when the wait ends, not halfway
+            // through the round trip, so it would put the estimate ahead.
+            if (!c.LongPoll && TryParseLong(r.Header(Headers.ServerTimeMs), out serverTime))
             {
                 clock.AddSample(serverTime, now - c.SentAt, now);
             }
@@ -749,8 +866,10 @@ namespace PaxosArena.Client
                     location = c.BaseUsed + location;
                 }
                 string origin = Origin(location);
-                if (origin.Length == 0)
+                if (origin.Length == 0 || !AllowedOrigin(origin))
                 {
+                    // No usable Location, or one that would leave https: not
+                    // followed and not cached, a retryable failure.
                     Retry(c, ErrorFrom(r, ParseError(r.Body)), Backoff.ParseRetryAfter(r.Header(Headers.RetryAfter)), now);
                     return;
                 }
@@ -787,6 +906,16 @@ namespace PaxosArena.Client
                 Retry(c, ErrorFrom(r, error), Backoff.ParseRetryAfter(r.Header(Headers.RetryAfter)), now);
                 return;
             }
+            if (ok && c.Kind == CallKind.Intent && !ReadableIntentAnswer(c.Intent, r))
+            {
+                // Not an answer the arena wrote: a transfer cut after the status
+                // line, a proxy or a captive portal. The intent is resent with
+                // its key, which returns the recorded answer if it was applied.
+                Retry(c, new ArenaError(r.Status, LocalErrorCodes.BadResponse,
+                    "a " + r.Status.ToString(CultureInfo.InvariantCulture) + " without " + Headers.Slot +
+                    " or a readable body; resending with the same key", true), 0, now);
+                return;
+            }
             c.Failures = 0;
             c.Unauthorized = 0;
             consecutiveFailures = 0;
@@ -805,10 +934,7 @@ namespace PaxosArena.Client
             if (c.MaxFailures > 0 && c.Failures >= c.MaxFailures)
             {
                 RemoveCall(c);
-                if (c.Abandoned != null)
-                {
-                    c.Abandoned(error);
-                }
+                Invoke(c.Abandoned, error);
                 return;
             }
             c.NotBefore = now + backoff.DelayMs(c.Failures, retryAfterSeconds);
@@ -842,11 +968,7 @@ namespace PaxosArena.Client
                 return;
             }
             connection = next;
-            Action<ConnectionState> handler = ConnectionChanged;
-            if (handler != null)
-            {
-                handler(next);
-            }
+            Invoke(ConnectionChanged, next);
         }
 
         string CurrentBaseUrl()
@@ -866,7 +988,7 @@ namespace PaxosArena.Client
         void DropLeader()
         {
             string dropped = state.leader_url;
-            if (lastLeaderHint.Length > 0 && lastLeaderHint != dropped)
+            if (lastLeaderHint.Length > 0 && lastLeaderHint != dropped && AllowedOrigin(lastLeaderHint))
             {
                 state.leader_url = lastLeaderHint;
             }
@@ -970,6 +1092,8 @@ namespace PaxosArena.Client
             }
             bool playerChanged = state.player_id.Length > 0 && state.player_id != s.player_id;
             bool resynced = playerChanged || (resyncAwaitingSession && c.ForResync);
+            ClientState before = Snapshot(state);
+            bool resyncBefore = resyncAwaitingSession;
             PendingIntent[] failed = null;
             state.player_id = s.player_id;
             state.session_token = s.session_token;
@@ -998,7 +1122,7 @@ namespace PaxosArena.Client
             {
                 resyncAwaitingSession = false;
             }
-            Save();
+            SaveOrRestore(before, resyncBefore);
             FlushSessionWaiters(ArenaResult<SessionResponse>.Success(s, slot));
             if (failed != null)
             {
@@ -1026,7 +1150,7 @@ namespace PaxosArena.Client
             sessionWaiters.Clear();
             for (int i = 0; i < waiters.Length; i++)
             {
-                waiters[i](result);
+                Invoke(waiters[i], result);
             }
         }
 
@@ -1049,17 +1173,10 @@ namespace PaxosArena.Client
             SetConnection(ConnectionState.Offline);
             for (int i = 0; i < dropped.Length; i++)
             {
-                if (dropped[i].Abandoned != null)
-                {
-                    dropped[i].Abandoned(error);
-                }
+                Invoke(dropped[i].Abandoned, error);
             }
             events.Detach();
-            Action<ArenaError> handler = Halted;
-            if (handler != null)
-            {
-                handler(error);
-            }
+            Invoke(Halted, error);
         }
 
         // ---- intents ----
@@ -1125,10 +1242,18 @@ namespace PaxosArena.Client
                 headSinceKey = head.idempotency_key;
                 headSinceMs = now;
             }
+            headCall = NewHeadCall(head);
+        }
+
+        // A method of its own: a lambda capturing the call in EnsureHeadCall
+        // would allocate its closure on every Update, before the early return.
+        Call NewHeadCall(PendingIntent head)
+        {
             Call c = NewCall(CallKind.Intent, head.method, head.path, head.body, head.idempotency_key, true, options.RequestTimeoutMs);
+            c.NotBefore = storeNotBefore;
             c.Intent = head;
             c.Answered = (response, error) => IntentAnswered(c, response, error);
-            headCall = c;
+            return c;
         }
 
         void IntentAnswered(Call c, HttpResponse r, ErrorBody error)
@@ -1146,6 +1271,10 @@ namespace PaxosArena.Client
             bool ok = r.Status >= 200 && r.Status < 300;
             long slot;
             TryParseLong(r.Header(Headers.Slot), out slot);
+            // If the answer cannot be saved, the head goes back and is resent
+            // with its key; its answer is delivered once it is saved.
+            ClientState before = Snapshot(state);
+            bool resyncBefore = resyncAwaitingSession;
             if (slot > state.last_intent_slot)
             {
                 state.last_intent_slot = slot;
@@ -1168,7 +1297,7 @@ namespace PaxosArena.Client
             bool sequenceError = error != null && (error.code == ErrorCodes.StaleSeq || error.code == ErrorCodes.SeqGap);
             if (!sequenceError && (ok || !IsClientBugStatus(r.Status)))
             {
-                Save();
+                SaveOrRestore(before, resyncBefore);
                 Deliver(outcome);
                 return;
             }
@@ -1186,7 +1315,7 @@ namespace PaxosArena.Client
             {
                 resyncAwaitingSession = true;
             }
-            Save();
+            SaveOrRestore(before, resyncBefore);
             Deliver(outcome);
             FailIntents(failed);
             if (known)
@@ -1195,18 +1324,11 @@ namespace PaxosArena.Client
             }
         }
 
+        /// <summary>Hands an outcome to the intent's callback and to IntentCompleted; neither depends on the other.</summary>
         void Deliver(IntentOutcome outcome)
         {
-            Action<IntentOutcome> callback = queue.TakeCallback(outcome.IdempotencyKey);
-            if (callback != null)
-            {
-                callback(outcome);
-            }
-            Action<IntentOutcome> handler = IntentCompleted;
-            if (handler != null)
-            {
-                handler(outcome);
-            }
+            Invoke(queue.TakeCallback(outcome.IdempotencyKey), outcome);
+            Invoke(IntentCompleted, outcome);
         }
 
         void FailIntents(PendingIntent[] failed)
@@ -1226,20 +1348,12 @@ namespace PaxosArena.Client
 
         void RaiseResumed()
         {
-            Action handler = Resumed;
-            if (handler != null)
-            {
-                handler();
-            }
+            Invoke(Resumed);
         }
 
         void RaiseResynced()
         {
-            Action handler = Resynced;
-            if (handler != null)
-            {
-                handler();
-            }
+            Invoke(Resynced);
         }
 
         void DropHeadCall()
@@ -1260,6 +1374,29 @@ namespace PaxosArena.Client
                     calls[i].Removed = true;
                     calls.RemoveAt(i);
                 }
+            }
+        }
+
+        /// <summary>
+        /// Whether a 2xx answer to an intent is one the arena wrote: it carries
+        /// X-Arena-Slot and a body of the route's response type.
+        /// </summary>
+        bool ReadableIntentAnswer(PendingIntent intent, HttpResponse r)
+        {
+            long slot;
+            if (intent == null || !TryParseLong(r.Header(Headers.Slot), out slot) || slot <= 0)
+            {
+                return false;
+            }
+            switch (intent.route)
+            {
+                case IntentRoutes.Join:
+                    return Parse<JoinResponse>(r.Body) != null;
+                case IntentRoutes.Claim:
+                    return Parse<ClaimResponse>(r.Body) != null;
+                default:
+                    RoundResponse round = Parse<RoundResponse>(r.Body);
+                    return round != null && round.round != null;
             }
         }
 
@@ -1351,21 +1488,15 @@ namespace PaxosArena.Client
                 if (response.Status >= 200 && response.Status < 300)
                 {
                     T value = Parse<T>(response.Body);
-                    done(value != null
+                    Invoke(done, value != null
                         ? ArenaResult<T>.Success(value, slot)
                         : ArenaResult<T>.Failure(new ArenaError(response.Status, LocalErrorCodes.BadResponse,
                             "the response body could not be read", false), slot));
                     return;
                 }
-                done(ArenaResult<T>.Failure(ErrorFrom(response, error), slot));
+                Invoke(done, ArenaResult<T>.Failure(ErrorFrom(response, error), slot));
             };
-            c.Abandoned = error =>
-            {
-                if (done != null)
-                {
-                    done(ArenaResult<T>.Failure(error, 0));
-                }
-            };
+            c.Abandoned = error => Invoke(done, ArenaResult<T>.Failure(error, 0));
         }
 
         void DeferFailure<T>(Action<ArenaResult<T>> done, ArenaError error)
@@ -1380,7 +1511,82 @@ namespace PaxosArena.Client
 
         void Save()
         {
-            store.Save(state);
+            try
+            {
+                store.Save(state);
+            }
+            catch (Exception e)
+            {
+                deferred.Add(() => Invoke(StoreFailed, e));
+                throw;
+            }
+        }
+
+        /// <summary>Saves; when the store throws, puts back the state as it was before the answer being handled, and rethrows.</summary>
+        void SaveOrRestore(ClientState before, bool resyncBefore)
+        {
+            try
+            {
+                Save();
+                storeFailures = 0;
+            }
+            catch
+            {
+                Restore(before);
+                resyncAwaitingSession = resyncBefore;
+                // The answer is fetched again with the key, after a backoff, so
+                // a store that keeps failing is not met with a resend per frame.
+                storeFailures++;
+                storeNotBefore = monotonicMs() + backoff.DelayMs(storeFailures, 0);
+                if (sessionNotBefore < storeNotBefore)
+                {
+                    sessionNotBefore = storeNotBefore;
+                }
+                throw;
+            }
+        }
+
+        // The arrays of the state are replaced, never changed in place, so a
+        // copy of the fields is a snapshot.
+        static ClientState Snapshot(ClientState s)
+        {
+            return new ClientState
+            {
+                version = s.version,
+                device_id = s.device_id,
+                device_secret = s.device_secret,
+                player_id = s.player_id,
+                session_token = s.session_token,
+                session_expires_at_ms = s.session_expires_at_ms,
+                last_assigned_seq = s.last_assigned_seq,
+                last_intent_slot = s.last_intent_slot,
+                leader_url = s.leader_url,
+                events_cursor = s.events_cursor,
+                pending = s.pending,
+                audits = s.audits,
+            };
+        }
+
+        void Restore(ClientState from)
+        {
+            state.version = from.version;
+            state.device_id = from.device_id;
+            state.device_secret = from.device_secret;
+            state.player_id = from.player_id;
+            state.session_token = from.session_token;
+            state.session_expires_at_ms = from.session_expires_at_ms;
+            state.last_assigned_seq = from.last_assigned_seq;
+            state.last_intent_slot = from.last_intent_slot;
+            state.leader_url = from.leader_url;
+            state.events_cursor = from.events_cursor;
+            state.pending = from.pending;
+            state.audits = from.audits;
+        }
+
+        /// <summary>A leader origin the client may follow and cache: https whenever a base URL is https.</summary>
+        bool AllowedOrigin(string origin)
+        {
+            return !requireHttps || origin.Length == 0 || origin.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
         }
 
         void ThrowIfDisposed()
@@ -1614,6 +1820,9 @@ namespace PaxosArena.Client
 
         /// <summary>A session started while a resynchronisation waited for next_seq.</summary>
         public bool ForResync;
+
+        /// <summary>An events request that waits on the server; its server time is not a clock sample.</summary>
+        public bool LongPoll;
 
         public PendingIntent Intent;
         public Action<HttpResponse, ErrorBody> Answered;

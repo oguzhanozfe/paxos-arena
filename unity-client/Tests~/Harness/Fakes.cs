@@ -82,6 +82,9 @@ namespace PaxosArena.Client.Harness
         public string Saved = "";
         public int Saves;
 
+        /// <summary>The next saves that throw, as a full disk would.</summary>
+        public int FailSaves;
+
         public MemoryStore(IJson json)
         {
             this.json = json;
@@ -94,6 +97,11 @@ namespace PaxosArena.Client.Harness
 
         public void Save(ClientState state)
         {
+            if (FailSaves > 0)
+            {
+                FailSaves--;
+                throw new System.IO.IOException("No space left on device");
+            }
             Saved = json.ToJson(state);
             Saves++;
         }

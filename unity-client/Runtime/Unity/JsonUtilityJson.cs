@@ -1,7 +1,7 @@
 using System;
 using UnityEngine;
 
-namespace PaxosArena.Client.Unity
+namespace PaxosArena.Client.UnityAdapters
 {
     /// <summary>
     /// <see cref="IJson"/> over UnityEngine.JsonUtility. Every body of the play
@@ -62,7 +62,7 @@ namespace PaxosArena.Client.Unity
 
     /// <summary>The wrapper object JsonUtility needs around an array.</summary>
     [Serializable]
-    [Preserve]
+    [UnityEngine.Scripting.Preserve]
     public sealed class JsonArray<T>
     {
         public T[] items = new T[0];

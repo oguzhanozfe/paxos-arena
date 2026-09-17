@@ -38,7 +38,8 @@ namespace PaxosArena.Client
         public const int NoColumn = -1;
     }
 
-    public static class EventType
+    /// <summary>The event types of GET /v1/events. Not EventType, which would clash with UnityEngine.EventType.</summary>
+    public static class ArenaEventType
     {
         public const string TournamentStatus = "tournament_status";
         public const string LeaderboardChanged = "leaderboard_changed";

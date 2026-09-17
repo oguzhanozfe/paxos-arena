@@ -165,6 +165,28 @@ namespace UnityEngine
     {
     }
 
+    // Declared so that the compile checks see the engine names the SDK's
+    // public names must not clash with (SampleCheck/NameClashCheck.cs).
+    public enum EventType
+    {
+        MouseDown = 0,
+        Layout = 8,
+        Repaint = 7,
+    }
+
+    public sealed class Event
+    {
+        public static Event current
+        {
+            get { throw CompileOnly.Fail(); }
+        }
+
+        public EventType type
+        {
+            get { throw CompileOnly.Fail(); }
+        }
+    }
+
     public struct Vector2
     {
         public float x;
@@ -255,6 +277,40 @@ namespace UnityEngine
         {
             throw CompileOnly.Fail();
         }
+    }
+}
+
+namespace UnityEngine.Scripting
+{
+    [AttributeUsage(AttributeTargets.Assembly | AttributeTargets.Class | AttributeTargets.Struct | AttributeTargets.Enum |
+                    AttributeTargets.Constructor | AttributeTargets.Method | AttributeTargets.Property | AttributeTargets.Field |
+                    AttributeTargets.Event | AttributeTargets.Interface | AttributeTargets.Delegate, Inherited = false)]
+    public class PreserveAttribute : Attribute
+    {
+    }
+}
+
+namespace UnityEngine.iOS
+{
+    using UnityStubs;
+
+    public static class Device
+    {
+        public static void SetNoBackupFlag(string path)
+        {
+            throw CompileOnly.Fail();
+        }
+    }
+}
+
+namespace Unity.Collections
+{
+    // Stands for the engine's global Unity.* namespaces, which a namespace
+    // named PaxosArena.Client.Unity would hide from code under PaxosArena.Client.
+    public enum Allocator
+    {
+        Invalid = 0,
+        Temp = 2,
     }
 }
 

@@ -771,6 +771,10 @@ The client follows a redirect once and caches the leader:
    response or is answered `503 no_leader`; then use `X-Arena-Leader` of the
    most recent response if it is not empty, and otherwise the next base URL
    of the SDK's configuration, round robin.
+5. When any base URL is `https`, never follow, cache or adopt an `http`
+   origin: a `307` to one is a retryable failure, and a stored `http` leader
+   is dropped at start. A downgrade would resend the device secret or the
+   token in clear text and keep every later request there.
 
 The SDK never lets the HTTP stack follow redirects itself
 (`UnityWebRequest.redirectLimit = 0`): stacks differ in whether they keep the
@@ -1497,7 +1501,7 @@ the board changes when the view arrives.
 | 400, 404, 405, 413, 422 | definitive, client bug | remove the head, deliver the error, resynchronise (9.2.4) |
 | 307 | redirect | follow once (7.1.5) |
 | 401 | session | open a new session (9.2.3), then resend the head with the new token |
-| any other response with `retryable` true; no response; timeout; a 5xx without a readable body | retryable | keep the head, back off (9.3), resend |
+| any other response with `retryable` true; no response; timeout; a 5xx without a readable body; a 2xx without `X-Arena-Slot` or without a body of the route's type (a transfer cut after the status line, a proxy or captive portal page) | retryable | keep the head, back off (9.3), resend |
 
 Nothing is dropped because of time: an intent resent hours later receives
 its recorded result, or a rule rejection such as `round_expired`. After
@@ -1508,7 +1512,11 @@ three consecutive retryable failures the SDK reports a connection problem
 
 - The SDK opens a session at start when it has no token or the token expires
   within 5 minutes by server time, before resending after a `401`, and on
-  resume under the same condition.
+  resume under the same condition. At start and on resume it has no server
+  clock estimate (9.4), so it cannot tell whether a stored token expired
+  while the app was away: until a response restores the estimate it sends
+  one authenticated request at a time, and an events poll asks with
+  `wait_ms=0`. A token that did expire costs that one request a `401`.
 - A session request has its own key, kept in memory for its retries; it is
   not an intent in the queue and has no `seq`.
 - A session response whose `expires_at_ms` is not after the server's time
@@ -1563,6 +1571,10 @@ seconds. A resend after a `307` or a `401` is not delayed.
 - A suspended app's monotonic clock may or may not advance, so the samples
   are cleared on resume and the first response after it sets the estimate
   again.
+- Events long-poll responses are not samples: the server stamps the header
+  when the wait ends, not halfway through the round trip, so a poll held for
+  25 seconds would put the estimate 12.5 seconds ahead. A poll sent with
+  `wait_ms=0` is a sample like any other response.
 
 ### 9.5 Pause, resume and network loss
 
@@ -1571,9 +1583,13 @@ seconds. A resend after a `307` or a `401` is not delayed.
   complete or fail; it is in the store either way.
 - `OnApplicationPause(false)`: clear the clock samples; open a session if
   needed (9.2.3); resend the head of the queue at once, with its backoff
-  reset; restart the events poll from the stored cursor; raise `Resumed`, on
-  which the game reads the round in play with `min_slot` and refreshes the
-  leaderboard.
+  reset, alone until a response restores the clock estimate (9.2.3); restart
+  the events poll from the stored cursor; raise `Resumed`, on which the game
+  reads the round in play with `min_slot` and refreshes the leaderboard.
+- After a cold start (the operating system may kill a backgrounded app) the
+  game holds no view. It lists the tournaments it entered and reads the
+  round named by `round_in_play` (7.3.2); `next_round` is 0 while a round is
+  in play.
 - Network loss is seen as requests failing without a response. Those are
   retryable failures under 9.2.2 and 9.3; the SDK does not wait for the
   platform's reachability signal.
@@ -1788,7 +1804,7 @@ unity-client/
         Reads.cs                        TournamentListResponse, TournamentSummary,
                                         LeaderboardResponse, LeaderboardRow, EventsResponse, EventItem
         Names.cs                        TournamentStatus, RoundStatus, FinishReason, MoveKind,
-                                        EventType, Headers
+                                        ArenaEventType, Headers
     Unity/                              UnityEngine adapters
       PaxosArena.Client.Unity.asmdef
       UnityWebRequestTransport.cs
@@ -1815,7 +1831,9 @@ unity-client/
 `Samples~` and `Tests~` end in `~`, so the Unity editor imports neither;
 the sample is copied into a project through the Package Manager's samples
 list, and the harness never enters a Unity project. Namespaces:
-`PaxosArena.Client` (Core), `PaxosArena.Client.Unity`,
+`PaxosArena.Client` (Core), `PaxosArena.Client.UnityAdapters` (in the
+assembly `PaxosArena.Client.Unity`; a namespace ending in `.Unity` would hide
+the engine's global `Unity.*` namespaces from code under `PaxosArena.Client`),
 `PaxosArena.Client.Sample`, `PaxosArena.Client.Harness`.
 
 `package.json`:
@@ -1851,7 +1869,7 @@ defaults):
 { "name": "PaxosArena.Client.Core", "rootNamespace": "PaxosArena.Client",
   "references": [], "noEngineReferences": true, "autoReferenced": true }
 
-{ "name": "PaxosArena.Client.Unity", "rootNamespace": "PaxosArena.Client.Unity",
+{ "name": "PaxosArena.Client.Unity", "rootNamespace": "PaxosArena.Client.UnityAdapters",
   "references": ["PaxosArena.Client.Core"], "autoReferenced": true }
 
 { "name": "PaxosArena.Client.Sample", "rootNamespace": "PaxosArena.Client.Sample",
@@ -2005,7 +2023,7 @@ namespace PaxosArena.Client
                            IJson json, Func<long> monotonicMs);
 
         public string PlayerId { get; }
-        public bool HasSession { get; }
+        public bool HasSession { get; }             // false until a response restores the clock estimate
         public bool Busy { get; }                   // an intent is pending
         public long ServerNowMs { get; }            // 9.4; 0 before the first response
         public ConnectionState Connection { get; }
@@ -2015,8 +2033,10 @@ namespace PaxosArena.Client
         public event Action Resynced;
         public event Action Resumed;
         public event Action<ConnectionState> ConnectionChanged;
+        public event Action<Exception> StoreFailed; // raised inside Update for every failed save
 
-        public void Update();                       // call every frame: sends, retries, timers, events
+        public void Update();                       // call every frame: sends, retries, timers, events; a callback
+                                                    // that throws stops nothing, its exception is rethrown at the end
         public void Pause();
         public void Resume();
         public void Dispose();
@@ -2058,7 +2078,9 @@ threads and reads time only through `monotonicMs`.
   `SetRequestHeader`; `timeout` = `TimeoutMs` rounded up to whole seconds;
   `redirectLimit = 0`. On completion it copies `responseCode`,
   `GetResponseHeaders()` and the text whenever `responseCode` is not 0, a
-  protocol error included; otherwise `Status` 0 with `TransportError` and
+  protocol error included, unless `result` is `ConnectionError` or
+  `DataProcessingError` for a status other than 3xx (a transfer cut after
+  the status line); otherwise `Status` 0 with `TransportError` and
   `TimedOut`; then disposes the request and calls `done`.
   `UnityWebRequest` completes on the main thread, which is the thread that
   pumps the client. Whether each target platform surfaces a 307 with
@@ -2069,10 +2091,17 @@ threads and reads time only through `monotonicMs`.
   `Path.Combine(Application.persistentDataPath, "paxos-arena", "client-state.json")`.
   `Save` writes `client-state.json.tmp`, flushes it to disk, then replaces
   the file (`File.Replace` with a `.bak` backup where the platform supports
-  it, otherwise delete and move). `Load` reads the file, falls back to the
-  `.bak`, and returns a fresh state when neither parses. A game that keeps
-  the device secret in the platform's keystore implements `IIntentStore`
-  itself.
+  it, otherwise copy to `.bak`, delete and move). `Load` reads the file, falls
+  back to the `.tmp` and then to the `.bak`, and when files exist but none
+  parses moves them aside as `*.corrupt-N` before it returns a fresh state,
+  so the credentials the client then draws never overwrite a recoverable
+  device secret. Only one store may be open on a directory in a process; it
+  is `IDisposable` and a second one throws until the first is disposed. On
+  iOS the directory is excluded from backups (`Device.SetNoBackupFlag`); on
+  Android the game's backup rules must exclude `files/paxos-arena/`, or a
+  restore onto a second device clones the player. Every save is synchronous
+  on the main thread with an fsync, two per intent. A game that keeps the
+  device secret in the platform's keystore implements `IIntentStore` itself.
 - `JsonUtilityJson`: `JsonUtility.ToJson(value)` and
   `JsonUtility.FromJson<T>(json)`.
 - `ArenaClientBehaviour`: serialized fields `baseUrls`, `jurisdiction`,
@@ -2112,7 +2141,8 @@ remove their constructors or fields. Unity documents `link.xml` files under
 `Assets`; the sample carries a copy so importing it puts one there, and a
 project that does not import the sample copies `Runtime/link.xml` to
 `Assets/PaxosArena/link.xml`. The model classes are also marked with a
-`PreserveAttribute` declared inside the Core, which the Unity linker
+`PreserveAttribute` declared inside the Core (internal, so it never clashes
+with `UnityEngine.Scripting.PreserveAttribute` in game code), which the Unity linker
 recognises by name without a reference to `UnityEngine`. Both must be
 checked with a stripped IL2CPP build during integration.
 

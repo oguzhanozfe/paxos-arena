@@ -8,14 +8,15 @@ namespace PaxosArena.Client
     /// and fields. The Unity linker recognises an attribute named
     /// PreserveAttribute from any assembly, so the Core needs no reference to
     /// UnityEngine for it. Runtime/link.xml preserves the whole assembly as
-    /// well; section 11.5 of the contract asks for both.
+    /// well; section 11.5 of the contract asks for both. It is internal, so it
+    /// never clashes with UnityEngine.Scripting.PreserveAttribute in game code.
     /// </summary>
     [AttributeUsage(
         AttributeTargets.Assembly | AttributeTargets.Class | AttributeTargets.Struct | AttributeTargets.Method |
         AttributeTargets.Constructor | AttributeTargets.Field | AttributeTargets.Property | AttributeTargets.Enum |
         AttributeTargets.Interface | AttributeTargets.Delegate | AttributeTargets.Event,
         Inherited = false)]
-    public sealed class PreserveAttribute : Attribute
+    internal sealed class PreserveAttribute : Attribute
     {
     }
 }

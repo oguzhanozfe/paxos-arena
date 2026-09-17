@@ -11,8 +11,10 @@
 #   run 2  the same flow on another tournament, with the leader process killed
 #          (SIGKILL) in the middle of a round while a move's answer has not
 #          reached the client. The client is rebuilt from its store, resends
-#          the move with the same key, follows a follower's 307 to the new
-#          leader, and the flow finishes with exactly one claim per paid
+#          the move with the same key, learns the new leader from a
+#          follower's 307 (on the move itself, or on a session refresh that
+#          reached the follower first), receives the recorded result from the
+#          new leader, and the flow finishes with exactly one claim per paid
 #          player in the ledger.
 #
 # After each run every replica must report the same applied slot and state

@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
-using PaxosArena.Client.Unity;
+using PaxosArena.Client.UnityAdapters;
 using UnityEngine;
 
 namespace PaxosArena.Client.Sample
@@ -19,6 +19,16 @@ namespace PaxosArena.Client.Sample
     /// The sample never changes the board itself: every button sends an intent
     /// and the view is replaced only by the server's answer. Callbacks run
     /// inside ArenaClient.Update, never inside OnGUI.
+    ///
+    /// After a cold start (the OS kills a backgrounded app) nothing but the
+    /// store survives: the tournament list names the round in play
+    /// (round_in_play), and the sample reads that round from the server
+    /// before it offers input again.
+    ///
+    /// OnGUI runs several times per frame (layout, input, repaint) and must lay
+    /// out the same controls each time, so everything that can change between
+    /// those passes, such as how long the client has been busy, is computed
+    /// once per frame in Update, together with the text it shows.
     ///
     /// Put it on a GameObject with an ArenaClientBehaviour whose base URLs point
     /// at the play listeners. For a local http:// server, allow downloads over
@@ -39,6 +49,13 @@ namespace PaxosArena.Client.Sample
         LeaderboardResponse leaderboard;
         string auditLine = "";
         Vector2 scroll;
+
+        // Computed in Update, read by OnGUI.
+        int busyTier;
+        string statusText = "";
+        string stateText = "";
+        bool stateDirty = true;
+        long shownSecondsLeft = -1;
 
         void Start()
         {
@@ -82,6 +99,28 @@ namespace PaxosArena.Client.Sample
             client.Events.Received += item => OnEvent(client, item);
         }
 
+        void Update()
+        {
+            ArenaClient client = host != null ? host.Client : null;
+            if (client == null)
+            {
+                return;
+            }
+            long busyFor = client.BusyForMs;
+            busyTier = busyFor > 10000 ? 2 : busyFor > 1000 ? 1 : 0;
+            statusText = "player " + (client.PlayerId.Length > 0 ? client.PlayerId : "(none yet)") +
+                         "   session " + client.HasSession +
+                         "   connection " + client.Connection +
+                         "   busy " + client.Busy;
+            long secondsLeft = SecondsLeft(client);
+            if (stateDirty || secondsLeft != shownSecondsLeft)
+            {
+                stateText = DescribeState(secondsLeft);
+                shownSecondsLeft = secondsLeft;
+                stateDirty = false;
+            }
+        }
+
         void OnGUI()
         {
             ArenaClient client = host != null ? host.Client : null;
@@ -94,7 +133,7 @@ namespace PaxosArena.Client.Sample
             else
             {
                 DrawControls(client);
-                DrawState(client);
+                GUILayout.Label(stateText);
             }
             GUILayout.EndScrollView();
             GUILayout.EndArea();
@@ -102,16 +141,12 @@ namespace PaxosArena.Client.Sample
 
         void DrawControls(ArenaClient client)
         {
-            GUILayout.Label("player " + (client.PlayerId.Length > 0 ? client.PlayerId : "(none yet)") +
-                            "   session " + client.HasSession +
-                            "   connection " + client.Connection +
-                            "   busy " + client.Busy);
-            long busyFor = client.BusyForMs;
-            if (busyFor > 10000)
+            GUILayout.Label(statusText);
+            if (busyTier == 2)
             {
                 GUILayout.Label("The connection is being restored. Your last move is kept and will be sent.");
             }
-            else if (busyFor > 1000)
+            else if (busyTier == 1)
             {
                 GUILayout.Label("reconnecting...");
             }
@@ -143,7 +178,7 @@ namespace PaxosArena.Client.Sample
             GUI.enabled = input && next > 0;
             if (GUILayout.Button(next > 0 ? "Deal round " + next : "Deal"))
             {
-                client.Deal(tid, next, r => OnRound(client, r));
+                client.Deal(tid, next, r => OnRound(client, tid, next, r));
             }
 
             bool playing = view != null && view.status == RoundStatus.Playing;
@@ -152,23 +187,25 @@ namespace PaxosArena.Client.Sample
             if (playing)
             {
                 // Buttons come from the server's view, with its move_index.
+                int round = view.round;
                 for (int i = 0; i < view.playable_columns.Length; i++)
                 {
                     int column = view.playable_columns[i];
                     if (GUILayout.Button("Play column " + column))
                     {
-                        client.Play(tid, view.round, view.move_index, column, r => OnRound(client, r));
+                        client.Play(tid, round, view.move_index, column, r => OnRound(client, tid, round, r));
                     }
                 }
                 if (view.can_draw && GUILayout.Button("Draw"))
                 {
-                    client.Draw(tid, view.round, view.move_index, r => OnRound(client, r));
+                    client.Draw(tid, round, view.move_index, r => OnRound(client, tid, round, r));
                 }
             }
             GUILayout.EndHorizontal();
-            if (GUILayout.Button(playing ? "Finish round " + view.round : "Finish"))
+            if (GUILayout.Button(playing ? "Finish round " + view.round : "Finish") && playing)
             {
-                client.Finish(tid, view.round, r => OnRound(client, r));
+                int round = view.round;
+                client.Finish(tid, round, r => OnRound(client, tid, round, r));
             }
 
             GUI.enabled = tournament != null;
@@ -186,22 +223,24 @@ namespace PaxosArena.Client.Sample
             GUI.enabled = true;
         }
 
-        void DrawState(ArenaClient client)
+        /// <summary>Everything below the buttons, as one text; rebuilt only when something changed.</summary>
+        string DescribeState(long secondsLeft)
         {
+            StringBuilder sb = new StringBuilder();
             if (tournament != null)
             {
-                GUILayout.Label("tournament " + tournament.tournament_id + ": " + tournament.status +
-                                ", entrants " + tournament.entrants + ", fee " + tournament.entry_fee +
-                                ", joined " + tournament.joined + ", rounds finished " + tournament.rounds_finished);
+                sb.Append("tournament ").Append(tournament.tournament_id).Append(": ").Append(tournament.status)
+                  .Append(", entrants ").Append(tournament.entrants).Append(", fee ").Append(tournament.entry_fee)
+                  .Append(", joined ").Append(tournament.joined).Append(", rounds finished ").Append(tournament.rounds_finished)
+                  .Append("\n\n");
             }
-            GUILayout.Label(DescribeView(client));
+            sb.Append(DescribeView(secondsLeft)).Append("\n\n");
             if (auditLine.Length > 0)
             {
-                GUILayout.Label(auditLine);
+                sb.Append(auditLine).Append("\n\n");
             }
             if (leaderboard != null)
             {
-                StringBuilder sb = new StringBuilder();
                 sb.Append("leaderboard (").Append(leaderboard.final ? "final" : "provisional").Append(")\n");
                 for (int i = 0; i < leaderboard.rows.Length; i++)
                 {
@@ -215,13 +254,26 @@ namespace PaxosArena.Client.Sample
                     }
                     sb.Append('\n');
                 }
-                GUILayout.Label(sb.ToString());
+                sb.Append('\n');
             }
-            GUILayout.Label("events\n" + string.Join("\n", eventLines.ToArray()));
-            GUILayout.Label("log\n" + string.Join("\n", logLines.ToArray()));
+            sb.Append("events\n").Append(string.Join("\n", eventLines.ToArray())).Append("\n\n");
+            sb.Append("log\n").Append(string.Join("\n", logLines.ToArray()));
+            return sb.ToString();
         }
 
-        string DescribeView(ArenaClient client)
+        /// <summary>Whole seconds to the round's deadline by the server clock estimate; -1 when not shown.</summary>
+        long SecondsLeft(ArenaClient client)
+        {
+            long serverNow = client.ServerNowMs;
+            if (view == null || view.status != RoundStatus.Playing || serverNow <= 0)
+            {
+                return -1;
+            }
+            long left = view.deadline_ms - serverNow;
+            return left > 0 ? left / 1000 : 0;
+        }
+
+        string DescribeView(long secondsLeft)
         {
             if (view == null)
             {
@@ -241,12 +293,10 @@ namespace PaxosArena.Client.Sample
             }
             sb.Append("waste ").Append(view.waste_top).Append(" (").Append(view.waste_count).Append(")  stock ")
               .Append(view.stock_count);
-            long serverNow = client.ServerNowMs;
-            if (view.status == RoundStatus.Playing && serverNow > 0)
+            if (secondsLeft >= 0)
             {
                 // Display only: the server decides the deadline.
-                long left = view.deadline_ms - serverNow;
-                sb.Append("  time left ").Append(left > 0 ? left / 1000 : 0).Append(" s");
+                sb.Append("  time left ").Append(secondsLeft).Append(" s");
             }
             return sb.ToString();
         }
@@ -284,7 +334,15 @@ namespace PaxosArena.Client.Sample
                     }
                 }
                 tournament = chosen;
+                stateDirty = true;
                 Log(chosen == null ? "no tournament to play" : "selected " + chosen.tournament_id);
+                // A cold start has no view: read the round in play from the
+                // server rather than wait for it to expire.
+                if (chosen != null && chosen.joined && chosen.round_in_play > 0 &&
+                    (view == null || view.tournament_id != chosen.tournament_id))
+                {
+                    ReadRound(client, chosen.tournament_id, chosen.round_in_play);
+                }
             });
         }
 
@@ -302,29 +360,31 @@ namespace PaxosArena.Client.Sample
                 }
                 return view.round < 3 ? view.round + 1 : 0;
             }
-            return tournament.next_round;
+            // No view of this tournament yet: a round in play is read, not dealt.
+            return tournament.round_in_play > 0 ? 0 : tournament.next_round;
         }
 
-        void OnRound(ArenaClient client, ArenaResult<RoundResponse> result)
+        void OnRound(ArenaClient client, string tournamentId, int round, ArenaResult<RoundResponse> result)
         {
             if (!result.Ok)
             {
                 Log("round intent failed: " + result.Error);
                 // The view may be stale (move_index_mismatch, round_expired,
-                // a resynchronisation): read the server's view again.
-                ReadRound(client);
+                // a resynchronisation): read the round the intent was for.
+                // A failed deal has no round to read (round_not_started).
+                ReadRound(client, tournamentId, round);
                 return;
             }
             ShowRound(client, result.Value.round);
         }
 
-        void ReadRound(ArenaClient client)
+        void ReadRound(ArenaClient client, string tournamentId, int round)
         {
-            if (view == null || tournament == null)
+            if (string.IsNullOrEmpty(tournamentId) || round < 1 || round > 3)
             {
                 return;
             }
-            client.GetRound(tournament.tournament_id, view.round, r =>
+            client.GetRound(tournamentId, round, r =>
             {
                 if (r.Ok)
                 {
@@ -340,6 +400,7 @@ namespace PaxosArena.Client.Sample
         void ShowRound(ArenaClient client, RoundView next)
         {
             view = next;
+            stateDirty = true;
             if (view.status == RoundStatus.Finished)
             {
                 CheckCommitment(client);
@@ -367,29 +428,39 @@ namespace PaxosArena.Client.Sample
                            (item.total_score > 0 ? " total " + item.total_score : "") +
                            (item.amount > 0 ? " amount " + item.amount : ""));
             Trim(eventLines);
+            stateDirty = true;
             if (tournament == null || item.tournament_id != tournament.tournament_id)
             {
                 return;
             }
-            if (item.type == EventType.LeaderboardChanged || item.type == EventType.TournamentStatus)
+            if (item.type == ArenaEventType.LeaderboardChanged || item.type == ArenaEventType.TournamentStatus)
             {
                 RefreshLeaderboard(client);
             }
-            if (item.type == EventType.TournamentStatus)
+            if (item.type == ArenaEventType.TournamentStatus)
             {
                 ListTournaments(client);
             }
-            if (item.type == EventType.RoundFinished && view != null && view.round == item.round &&
+            if (item.type == ArenaEventType.RoundFinished && view != null && view.round == item.round &&
                 view.status == RoundStatus.Playing)
             {
-                ReadRound(client);
+                ReadRound(client, item.tournament_id, item.round);
+            }
+            if (item.type == ArenaEventType.RoundStarted && (view == null || view.round < item.round))
+            {
+                // Dealt before a restart, or from another session of the player.
+                ReadRound(client, item.tournament_id, item.round);
             }
         }
 
+        /// <summary>On Resumed and Resynced: the list (which reads a round in play when there is no view), the round shown, the leaderboard.</summary>
         void Refresh(ArenaClient client)
         {
             ListTournaments(client);
-            ReadRound(client);
+            if (view != null)
+            {
+                ReadRound(client, view.tournament_id, view.round);
+            }
             RefreshLeaderboard(client);
         }
 
@@ -404,6 +475,7 @@ namespace PaxosArena.Client.Sample
                 if (r.Ok)
                 {
                     leaderboard = r.Value;
+                    stateDirty = true;
                 }
                 else
                 {
@@ -416,6 +488,7 @@ namespace PaxosArena.Client.Sample
         {
             logLines.Add(line);
             Trim(logLines);
+            stateDirty = true;
         }
 
         static void Trim(List<string> lines)

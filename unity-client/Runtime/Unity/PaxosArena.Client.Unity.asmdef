@@ -1,6 +1,6 @@
 {
     "name": "PaxosArena.Client.Unity",
-    "rootNamespace": "PaxosArena.Client.Unity",
+    "rootNamespace": "PaxosArena.Client.UnityAdapters",
     "references": [
         "PaxosArena.Client.Core"
     ],
