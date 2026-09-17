@@ -56,11 +56,12 @@ type readReq struct {
 // channels and wait on reply channels or their context. Run starts no
 // goroutine of its own; the caller runs it.
 type Runner struct {
-	core  *Core
-	send  func(replog.Envelope)
-	log   *slog.Logger
-	tick  time.Duration
-	start time.Time
+	core     *Core
+	send     func(replog.Envelope)
+	log      *slog.Logger
+	tick     time.Duration
+	start    time.Time
+	observer Observer
 
 	inbox   chan replog.Envelope
 	submits chan *waiter
@@ -120,6 +121,30 @@ func NewRunner(core *Core, send func(replog.Envelope), log *slog.Logger) *Runner
 	return r
 }
 
+// Observer watches a Runner's event loop, for debugging and visualisation.
+// The event loop calls every method synchronously, so an implementation must
+// return quickly: bounded work, no I/O, and no lock held longer than a short
+// critical section. Package debugfeed's Feed records into a fixed-size
+// buffer.
+type Observer interface {
+	// Received is called with every inbound message the event loop takes
+	// from the inbox, before the core steps it. Messages Deliver dropped
+	// are not seen.
+	Received(env replog.Envelope)
+	// Sent is called with every outbound message before it is handed to
+	// the transport.
+	Sent(env replog.Envelope)
+	// Changed is called after an event that changed the status snapshot,
+	// with the snapshot before and after it and the slots the event
+	// applied, in order. It must not retain or modify applied.
+	Changed(prev, cur Status, applied []Applied)
+}
+
+// Observe installs o, which then sees every message the event loop steps and
+// sends and every change of the status snapshot. It must be called before
+// Run. A nil o, the default, observes nothing and costs nothing.
+func (r *Runner) Observe(o Observer) { r.observer = o }
+
 // Dropped returns the number of inbound messages Deliver discarded because
 // the inbox was full.
 func (r *Runner) Dropped() uint64 { return r.dropped.Load() }
@@ -142,6 +167,9 @@ func (r *Runner) Run(ctx context.Context) error {
 			r.failAll(ErrStopped)
 			return nil
 		case env := <-r.inbox:
+			if r.observer != nil {
+				r.observer.Received(env)
+			}
 			r.after(r.core.Step(r.now(), env))
 		case <-ticker.C:
 			r.sweepAbandoned()
@@ -405,6 +433,9 @@ func (r *Runner) Held() int { return int(r.held.Load()) }
 // new snapshot in Status.
 func (r *Runner) after(outs []replog.Envelope) {
 	for _, env := range outs {
+		if r.observer != nil {
+			r.observer.Sent(env)
+		}
 		r.send(env)
 	}
 	type failedRead struct {
@@ -440,12 +471,16 @@ func (r *Runner) after(outs []replog.Envelope) {
 
 	st := r.core.Status()
 	r.mu.Lock()
-	if st.Applied > r.status.Applied {
+	prev := r.status
+	if st.Applied > prev.Applied {
 		close(r.advanced)
 		r.advanced = make(chan struct{})
 	}
 	r.status = st
 	r.mu.Unlock()
+	if r.observer != nil && st != prev {
+		r.observer.Changed(prev, st, applied)
+	}
 
 	for _, f := range failed {
 		f.rq.reply <- f.err

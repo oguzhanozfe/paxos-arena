@@ -44,11 +44,18 @@ func newCluster(t *testing.T) *cluster {
 // add starts a runner for cfg on store.
 func (c *cluster) add(cfg replog.Config, store replog.Store) *Runner {
 	c.t.Helper()
+	return c.addObserved(cfg, store, nil)
+}
+
+// addObserved starts a runner for cfg on store with observer o.
+func (c *cluster) addObserved(cfg replog.Config, store replog.Store, o Observer) *Runner {
+	c.t.Helper()
 	core, err := NewCore(cfg, store, rand.New(rand.NewPCG(uint64(cfg.Self), 0)))
 	if err != nil {
 		c.t.Fatal(err)
 	}
 	r := NewRunner(core, c.bus.Send, nil)
+	r.Observe(o)
 	c.bus.Register(cfg.Self, r.Deliver)
 	ctx, cancel := context.WithCancel(context.Background())
 	c.runners[cfg.Self] = r
