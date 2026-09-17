@@ -16,6 +16,7 @@ money moves outside the ledger.
 Contents: [The problem](#the-problem) |
 [Why consensus](#why-consensus-rather-than-a-single-database) |
 [Architecture](#architecture) | [Running it](#running-it) |
+[Using it from a Unity client](#using-it-from-a-unity-client) |
 [How it is tested](#how-it-is-tested) | [Trade-offs](#trade-offs) |
 [What is not done](#what-is-not-done) | [Further work](#further-work) |
 [Sources](#sources) | [Layout](#layout) | [License](#license)
@@ -599,8 +600,10 @@ starts three replicas as separate processes on `127.0.0.1` with `-wal` and
    (`SIGKILL`) in the middle of round 2 while a move it applied has not
    been answered to the game. The client is rebuilt from its store,
    resends the move with its key, gets no response from the dead leader,
-   follows a follower's `307` to the new leader and receives the recorded
-   result; the flow then finishes with exactly one claim per paid player.
+   learns the new leader from a follower's `307` (on the resend itself, or
+   on a session refresh the rebuilt client sent first) and receives the
+   recorded result from the new leader; the flow then finishes with exactly
+   one claim per paid player.
 
 After each run every replica must report the same applied slot and state
 hash through `GET /v1/node`; before the second check the killed replica is
@@ -648,6 +651,154 @@ e2e: identical state on every replica: node 1 applied 938 hash 964bab4e9c203b0a.
 e2e: PASS
 ```
 
+## Using it from a Unity client
+
+A mobile card game made with the Unity engine uses the cluster through the
+play API, which `arena` serves on a listener of its own (`-play-listen`),
+apart from the operator API above. The C# SDK in [`unity-client/`](unity-client/README.md)
+is a Unity Package Manager package (`com.paxosarena.client`, Unity 2022.3 or
+later, no dependencies beyond two built-in engine modules). The contract
+both sides implement, with every route, body, error code and client rule, is
+[`docs/UNITY-INTEGRATION.md`](docs/UNITY-INTEGRATION.md).
+
+```
+$ ARENA_SESSION_KEYS=k1=$(openssl rand -hex 32) ARENA_DEAL_SECRET=$(openssl rand -hex 32) \
+    go run ./cmd/arena -nodes 3 -listen 127.0.0.1:8081 -play-listen 127.0.0.1:9081
+```
+
+In the game: add an `ArenaClientBehaviour` to one object that lives for the
+whole session, set its base URLs to the play listeners (or one balancer),
+and call the client from game code. `Join`, `Deal`, `Play`, `Draw`, `Finish`
+and `ClaimPayout` are intents; `ListTournaments`, `GetRound` and
+`GetLeaderboard` are reads; `Events.Received` follows a long-poll. Every
+callback runs inside the client's `Update()`, which the behaviour pumps
+every frame. The package README has a complete quick start.
+
+### One round, and a lost response
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant G as Game and SDK
+    participant F as Replica 1 (follower)
+    participant L as Replica 2 (leader)
+    participant R as Replicated log
+    participant O as Operator
+    Note over G: first launch draws device_id and device_secret and saves them
+    G->>F: POST /v1/session, key S, device secret
+    F-->>G: 307 Location replica 2
+    Note over G: follows once, caches replica 2 as the leader
+    G->>L: POST /v1/session, same request
+    L->>R: OpenSession d.device.S
+    R-->>L: chosen and applied
+    L-->>G: 200 session_token, player_id, next_seq 1
+    G->>L: POST /v1/tournaments/t/join, key J, seq 1
+    L->>R: Enter, entry fee posted
+    L-->>G: 201 join_seq, next_seq 2
+    Note over G: every intent is saved on the device before its first send
+    G->>L: POST .../rounds/1/deal, key D, seq 2
+    Note over L: seed = HMAC(deal secret, t, player, 1)
+    L->>R: StartRound with the seed
+    R-->>L: chosen and applied: the seed is in the log before any card is shown
+    L-->>G: 201 tableau, waste card, commitment to the seed
+    G->>L: POST .../rounds/1/moves, key M, seq 3, move_index 0, draw
+    L->>R: PlayMove, checked on the authoritative board
+    L--xG: 200 new view (the response is lost)
+    G->>L: the same request, the same key M
+    Note over L: key M is recorded: replay, nothing applied twice
+    L-->>G: 200 replayed true, the recorded view
+    G->>L: POST .../rounds/1/finish, key X, seq 51
+    L->>R: FinishRound, score fixed by the state machine
+    L-->>G: 200 final view with the seed
+    Note over G: checks the revealed seed against the deal's commitment
+    G->>F: GET /v1/events?cursor=c (long-poll, any replica)
+    F-->>G: 200 round_finished, leaderboard_changed
+    G->>F: GET .../leaderboard (any replica, from applied state)
+    F-->>G: 200 rows and the player's own row
+    O->>L: Close, then Settle (operator API, internal network)
+    L->>R: standings, pool and prizes posted once
+    G->>L: POST .../payout/claim, key C, seq 142
+    L->>R: ClaimPayout, one claim posting per player
+    L-->>G: 200 amount
+```
+
+A request that reaches a follower is redirected (`307`), never forwarded, so
+the client always talks to the leader it cached and follows at most one
+redirect per attempt. Reads go to any replica and carry `min_slot`, so a
+player never sees a board older than their own last move. The answer to an
+intent is built from applied state only, so no card is shown before the
+command that dealt it was chosen.
+
+### Trust model
+
+The client is untrusted: a modified client can send any request at any time.
+The replicas crash, restart and partition but do not lie. One rule follows:
+the client sends intents, the cluster decides every outcome.
+
+| The client says | The cluster decides, in the replicated state machine |
+|---|---|
+| its device id and secret, and a jurisdiction and age at first launch | the player id, whether the secret matches, the signed session token and its expiry |
+| "enter tournament T" | eligibility, the entry fee posting, the join order |
+| "deal round r" | every card, from a seed derived with a secret only the replicas hold, written to the log before the first card is shown |
+| "play column c" or "draw", with the move count it saw | legality on the board rebuilt from the seed and the accepted moves, the new board, whether the round is over |
+| "finish round r" | the round's score and the entry's total; there is no score input |
+| "claim my payout" | whether anything is claimable, how much, and that it is claimed once |
+
+A captured request replayed with its key returns the recorded response and
+changes nothing; its sequence number under a new key is `stale_seq`, and a
+skipped number is `seq_gap`. Idempotency keys are namespaced by player, so
+no client can use a key another player will send. Round deadlines run on
+the state machine's clock, never the device's. The deal's commitment arrives
+with the deal and the seed when the round ends, so the client can verify
+that the stock was not changed after it saw the first cards. Rate limits per
+device, address and player run before anything is proposed, reads run on
+the caller's goroutine rather than the consensus event loop, and open events
+long-polls share one scan per applied slot and are bounded per replica
+([ADR 0014](docs/adr/0014-reads-off-the-event-loop.md)). Not defended:
+move suggestions by software on the device, one person with several devices,
+device attestation and account recovery; transport security is TLS in front
+of the play listener. Section 1 of the contract has the full threat table
+and section 13.2 what it does not cover.
+
+On the device the SDK keeps a write-ahead store: an intent is saved before
+its first send and resent byte for byte with its key until a definitive
+answer, across network loss, app pause and an app killed by the operating
+system. A `2xx` without `X-Arena-Slot` or a readable body (a transfer cut
+short, a captive portal page) is resent rather than trusted. A game callback
+that throws stops no other notification. The store holds the device secret;
+on iOS it is excluded from backups, and on Android the game's backup rules
+must exclude it (the package README says how).
+
+### Running the client checks and the end-to-end test
+
+The C# checks need a .NET SDK, version 8 or later. From the repository root:
+
+```
+# the Core, the Unity adapters and the sample as separate netstandard2.1 / C# 9
+# assemblies against compile-only engine stubs, with a check that no SDK name
+# clashes with an engine name
+dotnet build "unity-client/Tests~/UnityStubs/SampleCheck/SampleCheck.csproj"
+
+# the SDK's unit tests with a fake transport, store and clock (35 tests)
+dotnet run --project "unity-client/Tests~/Harness/Harness.csproj" -- --unit
+
+# the harness against three arena processes, then again with the leader killed
+scripts/e2e.sh                    # or: make e2e
+E2E_KEEP=1 scripts/e2e.sh         # keep the work directory, wal files and logs
+E2E_PORT_BASE=48080 scripts/e2e.sh
+```
+
+`scripts/e2e.sh` builds `arena` and the harness, generates a session key and
+a deal secret, starts three replicas as separate processes with `-wal` and
+`-play-listen`, and runs the whole flow twice, as described
+[above](#scriptse2esh-the-client-sdk-against-three-processes). Without
+`dotnet` it prints `SKIP` and exits 0; it is not part of `make check` or CI.
+A run takes about 70 seconds. The SDK has been compiled against stubs and
+run against the cluster from `dotnet`; what still needs a Unity build on a
+device (a `307` with `redirectLimit = 0` on each platform, IL2CPP stripping,
+`File.Replace` under `persistentDataPath`) is listed in contract sections
+11.3 and 11.5.
+
 ## How it is tested
 
 Four layers, all under the race detector in CI.
@@ -685,7 +836,8 @@ Four layers, all under the race detector in CI.
    identifiers that collide in posting keys, a waiter handed another
    payload's result, a restarted process forgetting an acknowledged write,
    oversized commands, abandoned requests, a data race between a handler
-   and the event loop, truncated forwarded responses) and sweeps fault
+   and the event loop, truncated forwarded responses, events long-polls and
+   leaderboard reads that multiplied work on the event loop) and sweeps fault
    schedules the named scenarios do not use: heavy loss without the lease,
    even cluster sizes, clock skew without the lease, extreme reordering,
    partitions that flap faster than an election. The ones that found
@@ -765,26 +917,27 @@ $ go vet ./...
 $ go mod tidy -diff
 
 $ go test -race -count=1 ./...
-ok  	github.com/oguzhanozfe/paxos-arena/cmd/arena	6.082s
-ok  	github.com/oguzhanozfe/paxos-arena/cmd/chaos	14.865s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/api	2.507s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/game	2.471s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/intent	4.023s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/jsonx	3.064s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/ledger	2.519s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/paxos	4.259s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/replica	6.591s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/replog	42.061s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/replog/wal	4.294s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/session	4.111s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/sim	141.804s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/tournament	25.556s
-ok  	github.com/oguzhanozfe/paxos-arena/internal/transport	7.744s
+ok  	github.com/oguzhanozfe/paxos-arena/cmd/arena	5.281s
+ok  	github.com/oguzhanozfe/paxos-arena/cmd/chaos	16.089s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/api	3.579s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/game	2.649s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/intent	37.898s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/jsonx	1.847s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/ledger	3.780s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/paxos	3.697s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/replica	7.380s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/replog	41.692s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/replog/wal	4.601s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/session	3.525s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/sim	142.057s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/tournament	25.742s
+ok  	github.com/oguzhanozfe/paxos-arena/internal/transport	7.891s
 ```
 
-That is 2 min 22 s of wall time on 18 cores; the reviewers' adversarial
-tests account for most of the `replog` time, and the fourteen scenarios at 50
-seeds each for most of `internal/sim`. The same suite passes with
+That is about 2 min 25 s of wall time on 18 cores; the reviewers' adversarial
+tests account for most of the `replog` time, the fourteen scenarios at 50
+seeds each for most of `internal/sim`, and building a 3 000-entrant
+tournament for the leaderboard cost test for most of `internal/intent`. The same suite passes with
 `-shuffle=on`; without `-race` it takes about 17 s. Under `-race`,
 `internal/sim` needs close to two and a half minutes per `-count`, so raising `-count`
 needs a `-timeout` above Go's default of ten minutes, as `make race` and CI
@@ -899,7 +1052,11 @@ Each item is a boundary of the system as built, not an oversight.
   testing, no tuning of `Window` or timeouts beyond what makes the simulation
   and the demo work. Applying a command runs on the replica's event loop, so
   a large command delays heartbeats; the 64 KiB body limit keeps that well
-  under an election timeout. `internal/sim` takes about 140 s under
+  under an election timeout. Reads never run there: a slow read delays the
+  answers to commands, not heartbeats
+  ([ADR 0014](docs/adr/0014-reads-off-the-event-loop.md)). A leaderboard read
+  still ranks every entry, O(n log n) per request, about 0.2 ms at 3000
+  entrants. `internal/sim` takes about 140 s under
   `-race`.
 
 ## Further work
