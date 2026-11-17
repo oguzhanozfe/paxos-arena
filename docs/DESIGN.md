@@ -1560,7 +1560,7 @@ Deliverables: `README.md` following the outline in
 least: read index over lease reads, ledger inside the state machine,
 in-memory idempotency map as an optimization only); `.github/workflows/go.yml`
 (gofmt, vet, build, tidy -diff, test -race, matrix oldstable/stable,
-`GOTOOLCHAIN=local`, jobs skipped while the repository is private);
+`GOTOOLCHAIN=local`);
 `Makefile` with `check` and `sim-long`; `LICENSE`; `internal/replog/wal` with
 `TestTornTail` (added after review, required by `arena -peers`).
 

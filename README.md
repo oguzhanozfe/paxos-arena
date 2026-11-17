@@ -150,9 +150,9 @@ and `tournament` (for `game`, `ledger` and `tournament`), which inspect `go list
   internal/transport   Network (in-memory, seeded drop/dup/delay/partition), Local (in-process
                        bus), HTTP (POST /internal/paxos between processes)
   internal/api         net/http handlers: idempotency keys, forwarding, problem+json errors
-  internal/game        milestone 4: Ladder card puzzle rules, seeded deals, moves, scores
-  internal/session     milestone 4: HMAC session tokens, keyrings, device verifiers
-  internal/intent      milestone 4: the play API for game clients (sessions, intents, events)
+  internal/game        Ladder card puzzle rules, seeded deals, moves, scores
+  internal/session     HMAC session tokens, keyrings, device verifiers
+  internal/intent      the play API for game clients (sessions, intents, events)
   internal/sim         virtual clock, event heap, fault schedule, operator and play clients, scenarios, Checker
   cmd/arena            the service; cmd/chaos: the simulator's command line
 
@@ -922,7 +922,7 @@ Four layers, all under the race detector in CI.
    demo. Outside `go test`, `scripts/e2e.sh` runs the C# client SDK's
    harness against three `arena` processes, once with the leader killed
    mid-round ([below](#scriptse2esh-the-client-sdk-against-three-processes)).
-4. Adversarial tests written by reviewers, one file per package
+4. Adversarial regression tests, one file per package
    (`adversarial_test.go`, `*_review_test.go`): each attacks one guarantee
    (a chosen but unlearned value surviving a takeover, stale acceptances
    counted toward a quorum, a proposer changing its value within a ballot,
@@ -1028,7 +1028,7 @@ ok  	github.com/oguzhanozfe/paxos-arena/internal/tournament	25.742s
 ok  	github.com/oguzhanozfe/paxos-arena/internal/transport	7.891s
 ```
 
-That is about 2 min 25 s of wall time on 18 cores; the reviewers' adversarial
+That is about 2 min 25 s of wall time on 18 cores; the adversarial
 tests account for most of the `replog` time, the fourteen scenarios at 50
 seeds each for most of `internal/sim`, and building a 3 000-entrant
 tournament for the leaderboard cost test for most of `internal/intent`. The same suite passes with
@@ -1109,7 +1109,7 @@ Each item is a boundary of the system as built, not an oversight.
   floors, an external payment provider and reconciliation are out of scope.
 - Authentication, authorisation, TLS. Player identifiers, jurisdiction and
   age are claims taken as given. Anyone who can reach the API can create,
-  close and settle tournaments. The milestone 4 contract adds device-bound
+  close and settle tournaments. The play contract adds device-bound
   sessions with signed tokens for game clients on a separate listener; the
   operator API stays unauthenticated. The inter-replica transport is plain HTTP
   and does not authenticate its peers.
@@ -1230,14 +1230,14 @@ paxos-arena/
   internal/replica/             Core (pure) and Runner (event loop)
   internal/debugfeed/           ring buffer and GET /debug/events of arena -debug-feed
   internal/api/                 HTTP handlers
-  internal/game/                milestone 4: card puzzle rules, deals, scores
-  internal/session/             milestone 4: session tokens and device verifiers
-  internal/intent/              milestone 4: the play API served by arena -play-listen
+  internal/game/                card puzzle rules, deals, scores
+  internal/session/             session tokens and device verifiers
+  internal/intent/              the play API served by arena -play-listen
   internal/sim/                 deterministic simulation, play workload and invariant checker
-  unity-client/                 milestone 4: C# client SDK, its harness and compile checks
+  unity-client/                 C# client SDK, its harness and compile checks
   scripts/e2e.sh                the SDK harness against three arena processes, with a leader kill
   docs/DESIGN.md                the specification
-  docs/UNITY-INTEGRATION.md     milestone 4 contract: server-authoritative play from a game client
+  docs/UNITY-INTEGRATION.md     contract: server-authoritative play from a game client
   docs/adr/                     decisions taken during implementation
   docs/research/                consensus, domain and Go practice notes with sources
   testdata/seeds.txt            seeds that once failed (empty)

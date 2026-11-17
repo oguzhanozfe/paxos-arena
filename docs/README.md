@@ -18,7 +18,7 @@ the ADR takes precedence over the affected paragraph.
 
 ## `UNITY-INTEGRATION.md`
 
-The contract for milestone 4, server-authoritative play from a mobile game
+The contract for server-authoritative play from a mobile game
 client built with the Unity engine, written so that the Go server and the
 C# client can be built in parallel: the trust model; device-bound sessions
 with HMAC-SHA256 tokens and key rotation; idempotency keys and per-player
